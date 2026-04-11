@@ -25,18 +25,22 @@ app.use(express.json());
 
 // ── CORS: allow Extensy frontend and sidekick.extensy.dev ─────────────────
 app.use((req, res, next) => {
-  const allowed = [
-    "http://localhost:3000",
-    "https://extensy.app",
-    "https://www.extensy.app",
-    "https://sidekick.extensy.dev",
-  ];
   const origin = req.headers.origin ?? "";
-  if (allowed.includes(origin) || process.env.NODE_ENV !== "production") {
+  // Allow localhost, all extensy.app subdomains, and Vercel preview URLs
+  const isAllowed =
+    origin === "http://localhost:3000" ||
+    origin === "http://localhost:3001" ||
+    origin.endsWith(".extensy.app") ||
+    origin === "https://extensy.app" ||
+    origin.endsWith(".vercel.app") ||   // Vercel preview deployments
+    process.env.NODE_ENV !== "production";
+
+  if (isAllowed) {
     res.setHeader("Access-Control-Allow-Origin", origin || "*");
   }
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Allow-Credentials", "true");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
