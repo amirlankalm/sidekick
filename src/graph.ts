@@ -395,6 +395,11 @@ Rules:
 async function qaNode(
   state: ExtensyState
 ): Promise<Partial<ExtensyState>> {
+  if (state.subscription_tier === "free") {
+    console.log("[qa_node] Skipping QA for free tier to optimize generation speed.");
+    return { qa_logs: [] };
+  }
+
   console.log("[qa_node] Writing extension to disk and launching Playwright…");
 
   await writeExtensionToDisk(state.source_code);
