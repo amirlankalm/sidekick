@@ -5,7 +5,7 @@
       "src": "src/server.ts",
       "use": "@vercel/node",
       "config": {
-        "includeFiles": ["src/**", ".env"]
+        "includeFiles": ["src/**"]
       }
     }
   ],
@@ -14,11 +14,5 @@
       "src": "/(.*)",
       "dest": "src/server.ts"
     }
-  ],
-  "env": {
-    "ANTHROPIC_API_KEY": "@sidekick_anthropic_key",
-    "NIA_API_KEY": "@sidekick_nia_key",
-    "SUPABASE_URL": "@sidekick_supabase_url",
-    "SUPABASE_ANON_KEY": "@sidekick_supabase_anon_key"
-  }
+  ]
 }

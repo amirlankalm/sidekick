@@ -41,7 +41,8 @@ import "dotenv/config";
 import path from "path";
 import fs from "fs/promises";
 // Use @sparticuz/chromium on Vercel (serverless), local Playwright elsewhere.
-import { chromium as playwrightChromium } from "playwright";
+// We always import from playwright-core (no bundled browser binary).
+import { chromium as playwrightChromium } from "playwright-core";
 import sparticuzChromium from "@sparticuz/chromium";
 import { StateGraph, END, START } from "@langchain/langgraph";
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";

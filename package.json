@@ -2,7 +2,7 @@
   "name": "sidekick-engine",
   "version": "1.0.0",
   "description": "Core LangGraph backend engine for Extensy — autonomous Chrome Extension builder",
-  "main": "dist/graph.js",
+  "main": "dist/server.js",
   "scripts": {
     "build": "tsc",
     "start": "node dist/server.js",
@@ -14,18 +14,18 @@
     "@langchain/anthropic": "^0.3.21",
     "@langchain/core": "^0.3.40",
     "@langchain/langgraph": "^0.2.67",
-    "@sparticuz/chromium": "^147.0.0",
+    "@sparticuz/chromium": "^133.0.0",
     "@supabase/supabase-js": "^2.49.4",
     "@types/express": "^5.0.6",
-    "@types/jszip": "^3.4.0",
     "dotenv": "^16.5.0",
     "express": "^5.2.1",
     "jszip": "^3.10.1",
-    "playwright": "^1.52.0",
-    "serverless-http": "^4.0.0"
+    "playwright-core": "^1.50.0"
   },
   "devDependencies": {
+    "@types/jszip": "^3.4.0",
     "@types/node": "^22.19.17",
+    "playwright": "^1.50.0",
     "ts-node": "^10.9.2",
     "typescript": "^5.8.3"
   }
