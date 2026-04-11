@@ -1,0 +1,21 @@
+# Compiled output
+dist/
+
+# Playwright browser binaries (installed separately)
+.playwright/
+
+# Temporary extension directory used by qa_node
+tmp/
+
+# Assembled ZIP output
+output/
+
+# Environment secrets
+.env
+.env.local
+
+# Node
+node_modules/
+
+# OS
+.DS_Store
