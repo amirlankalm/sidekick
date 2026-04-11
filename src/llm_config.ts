@@ -34,10 +34,13 @@ const SONNET_MODEL = "claude-sonnet-4-5";
 const HAIKU_MODEL = "claude-haiku-4-5";
 
 // ---------------------------------------------------------------------------
-// Maximum token limits (conservative to avoid runaway costs)
+// Maximum token limits
 // ---------------------------------------------------------------------------
-const MAX_TOKENS_SONNET = 16000; // coder needs full headroom for large extensions
-const MAX_TOKENS_HAIKU = 6000;   // legal / routing — extra buffer for long docs
+// claude-haiku-4-5 supports up to 8192 output tokens.
+// claude-sonnet-4-5 supports up to 64000 but we cap at 32000 to control cost.
+// Coder node needs the full budget — extensions can be 5–10 files each 50–200 lines.
+const MAX_TOKENS_SONNET = 32000;
+const MAX_TOKENS_HAIKU  = 8192;
 
 // ---------------------------------------------------------------------------
 // NodeRole — semantic label used to select the right model variant

@@ -340,11 +340,29 @@ Rules:
       .trim();
     sourceCode = JSON.parse(cleaned) as SourceCode;
   } catch (err) {
-    console.error("[coder_node] Failed to parse source_code JSON:", err);
-    return {
-      error: `coder_node: Failed to parse generated source — ${String(err)}`,
-    };
+    // ── Fallback: try to extract individual file entries via regex ─────────
+    // This rescues truncated responses where the final }" is cut off.
+    console.warn("[coder_node] Full JSON parse failed, attempting partial extraction:", String(err));
+
+    const partialFiles: SourceCode = {};
+    // Match "filename": "content" pairs — content may span multiple lines
+    const filePattern = /"([^"]+\.(?:js|ts|html|css|json|md|txt|svg|png))"\s*:\s*"((?:[^"\\]|\\.)*)"/gs;
+    let match: RegExpExecArray | null;
+    while ((match = filePattern.exec(raw)) !== null) {
+      const [, filename, content] = match;
+      partialFiles[filename] = content.replace(/\\n/g, "\n").replace(/\\t/g, "\t").replace(/\\\\/g, "\\").replace(/\\"/g, '"');
+    }
+
+    if (Object.keys(partialFiles).length > 0) {
+      console.warn(`[coder_node] Recovered ${Object.keys(partialFiles).length} file(s) from partial response`);
+      sourceCode = partialFiles;
+    } else {
+      return {
+        error: `coder_node: Failed to parse generated source — ${String(err)}`,
+      };
+    }
   }
+
 
   console.log(
     `[coder_node] Generated ${Object.keys(sourceCode).length} file(s): ${Object.keys(sourceCode).join(", ")}`
