@@ -40,6 +40,7 @@
 import "dotenv/config";
 import path from "path";
 import fs from "fs/promises";
+import os from "os";
 // Use @sparticuz/chromium on Vercel (serverless), local Playwright elsewhere.
 // We always import from playwright-core (no bundled browser binary).
 import { chromium as playwrightChromium } from "playwright-core";
@@ -71,10 +72,10 @@ import {
 const MAX_QA_RETRIES = 3;
 
 /** Directory where Playwright loads the extension under test */
-const TMP_EXT_DIR = path.resolve("./tmp/extension");
+const TMP_EXT_DIR = path.join(os.tmpdir(), "sidekick", "extension");
 
-/** Where the assembled ZIP is written */
-const OUTPUT_DIR = path.resolve("./output");
+/** Where the assembled ZIP is written (local dev only; skipped on Vercel) */
+const OUTPUT_DIR = path.join(os.tmpdir(), "sidekick", "output");
 
 // ---------------------------------------------------------------------------
 // Supabase client (used by legal_node to persist the TOS document)
@@ -667,8 +668,6 @@ async function assemblerNode(
 ): Promise<Partial<ExtensyState>> {
   console.log("[assembler_node] Assembling final Chrome Extension ZIP…");
 
-  await fs.mkdir(OUTPUT_DIR, { recursive: true });
-
   const zip = new JSZip();
   const sourceCode = state.source_code;
 
@@ -684,15 +683,32 @@ async function assemblerNode(
     );
   }
 
-  const zipBuffer = await zip.generateAsync({ type: "nodebuffer" });
   const extensionName =
     state.blueprint?.name?.replace(/\s+/g, "_") ?? "extension";
-  const outputPath = path.join(OUTPUT_DIR, `${extensionName}_${Date.now()}.zip`);
+  const timestamp = Date.now();
 
-  await fs.writeFile(outputPath, zipBuffer);
+  // On Vercel the filesystem outside /tmp is read-only and short-lived,
+  // so we skip the disk write. The ZIP bytes are generated in-memory only.
+  // Extensy reads source_code via the `files` SSE event — artifact_path
+  // is only used for local dev logging.
+  const isVercel = process.env.VERCEL === "1";
+  let artifactPath = `in-memory:${extensionName}_${timestamp}.zip`;
 
-  console.log(`[assembler_node] ✅ Extension packaged at: ${outputPath}`);
-  return { artifact_path: outputPath };
+  if (!isVercel) {
+    try {
+      await fs.mkdir(OUTPUT_DIR, { recursive: true });
+      const zipBuffer = await zip.generateAsync({ type: "nodebuffer" });
+      artifactPath = path.join(OUTPUT_DIR, `${extensionName}_${timestamp}.zip`);
+      await fs.writeFile(artifactPath, zipBuffer);
+      console.log(`[assembler_node] ✅ Extension packaged at: ${artifactPath}`);
+    } catch (err) {
+      console.warn("[assembler_node] ZIP write failed (non-fatal):", err);
+    }
+  } else {
+    console.log(`[assembler_node] ✅ Extension ready (Vercel — in-memory only): ${extensionName}`);
+  }
+
+  return { artifact_path: artifactPath };
 }
 
 // ---------------------------------------------------------------------------
