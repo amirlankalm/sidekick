@@ -41,6 +41,7 @@ import "dotenv/config";
 import path from "path";
 import fs from "fs/promises";
 import os from "os";
+import * as crypto from "crypto";
 // Use @sparticuz/chromium on Vercel (serverless), local Playwright elsewhere.
 // We always import from playwright-core (no bundled browser binary).
 import { chromium as playwrightChromium } from "playwright-core";
@@ -691,9 +692,13 @@ Use plain English. Return plain text only (no markdown).`;
 
   // ── Upload TOS to Supabase Storage ───────────────────────────────────────
   let legalUrl = "";
+  let cleanAuthor = state.author.toLowerCase().replace(/[^a-z0-9]/g, '-');
+  if (!cleanAuthor || cleanAuthor.length === 0) cleanAuthor = "user";
+  const tosId = state.tos_id || crypto.randomUUID();
+
   try {
     const supabase = getSupabaseClient();
-    const fileName = `tos/${extensionName.replace(/\s+/g, "_")}_${Date.now()}.txt`;
+    const fileName = `tos/${cleanAuthor}/${tosId}.txt`;
 
     const { error } = await supabase.storage
       .from("legal-docs")
@@ -704,13 +709,10 @@ Use plain English. Return plain text only (no markdown).`;
 
     if (error) {
       console.error("[legal_node] Supabase upload error:", error.message);
-      // Non-fatal: embed the TOS inline as a data URL fallback.
       legalUrl = `data:text/plain;base64,${Buffer.from(tosContent).toString("base64")}`;
     } else {
-      const { data: publicData } = supabase.storage
-        .from("legal-docs")
-        .getPublicUrl(fileName);
-      legalUrl = publicData.publicUrl;
+      // Return a clean vanity URL hosted by Extensy Next.js app
+      legalUrl = `https://app.extensy.dev/${cleanAuthor}/terms-of-service/${tosId}`;
     }
   } catch (err) {
     console.error("[legal_node] Unexpected Supabase error:", err);

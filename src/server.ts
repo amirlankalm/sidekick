@@ -56,10 +56,14 @@ app.post("/generate", async (req: Request, res: Response) => {
     prompt,
     subscription_tier = "free",
     planning_mode = true,
+    author = "user",
+    tos_id = "",
   } = req.body as {
     prompt?: string;
     subscription_tier?: "free" | "pro" | "max";
     planning_mode?: boolean;
+    author?: string;
+    tos_id?: string;
   };
 
   if (!prompt?.trim()) {
@@ -99,6 +103,8 @@ app.post("/generate", async (req: Request, res: Response) => {
         user_prompt: prompt,
         subscription_tier,
         planning_mode,
+        author,
+        tos_id,
       } as Partial<ExtensyState>,
       { version: "v2" }
     );

@@ -103,6 +103,18 @@ export const StateAnnotation = Annotation.Root({
     default: () => true,
   }),
 
+  /** The author username passed from Extensy */
+  author: Annotation<string>({
+    reducer: (_, next) => next,
+    default: () => "user",
+  }),
+
+  /** Unique ID for the project TOS */
+  tos_id: Annotation<string>({
+    reducer: (_, next) => next,
+    default: () => "",
+  }),
+
   // ── Intermediate ──────────────────────────────────────────────────────────
 
   /**
