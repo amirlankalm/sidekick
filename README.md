@@ -21,20 +21,20 @@ flowchart TD
 
     Start([Start]) --> InitialRouter{Initial Router}
     
-    InitialRouter -- "Free / No Planning" --> Coder[Coder Node]
-    InitialRouter -- "Pro / Max" --> Architect[Architect Node<br/>(Planning)]
+    InitialRouter -- "Free / No Planning" --> Coder["Coder Node"]
+    InitialRouter -- "Pro / Max" --> Architect["Architect Node<br/>(Planning)"]
     
     Architect --> ResearchRouter{Research Router}
     
-    ResearchRouter -- "Max Tier" --> Researcher[Researcher Node<br/>(Nia Context)]
+    ResearchRouter -- "Max Tier" --> Researcher["Researcher Node<br/>(Nia Context)"]
     ResearchRouter -- "Pro / Free" --> Coder
     
     Researcher --> Coder:::coreStyle
     
     Coder --> UIDesignerRouter{UI Router}
     
-    UIDesignerRouter -- "Free" --> QA[QA Node<br/>(Playwright)]
-    UIDesignerRouter -- "Pro / Max" --> UIDesigner[UI Designer Node<br/>(Styling)]:::coreStyle
+    UIDesignerRouter -- "Free" --> QA["QA Node<br/>(Playwright)"]
+    UIDesignerRouter -- "Pro / Max" --> UIDesigner["UI Designer Node<br/>(Styling)"]:::coreStyle
     
     UIDesigner --> QA:::qaStyle
     
@@ -43,12 +43,12 @@ flowchart TD
     QARouter -- "Errors Found" --> Coder
     QARouter -- "Pass / Max Retries" --> FanOutRouter{Fan Out Router}
     
-    FanOutRouter -- "Free Tier" --> Assembler[Assembler Node<br/>(ZIP Creation)]
-    FanOutRouter -- "Pro Tier" --> Legal[Legal Node<br/>(Terms of Service)]
-    FanOutRouter -- "Max Tier" --> ParallelHub((Parallel<br/>Hub))
+    FanOutRouter -- "Free Tier" --> Assembler["Assembler Node<br/>(ZIP Creation)"]
+    FanOutRouter -- "Pro Tier" --> Legal["Legal Node<br/>(Terms of Service)"]
+    FanOutRouter -- "Max Tier" --> ParallelHub(("Parallel<br/>Hub"))
     
     ParallelHub --> Legal
-    ParallelHub --> Integration[Integration Node<br/>(3rd Party APIs)]
+    ParallelHub --> Integration["Integration Node<br/>(3rd Party APIs)"]
     
     Legal --> Assembler:::passStyle
     Integration --> Assembler
