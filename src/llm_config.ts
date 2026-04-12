@@ -54,6 +54,7 @@ export type NodeRole =
   | "architect"    // Planning, blueprint extraction  → always Sonnet
   | "researcher"   // Nia API context retrieval        → always Sonnet
   | "coder"        // Source generation                → tier-dependent
+  | "ui_designer"  // UI styling & layout              → always Sonnet
   | "legal"        // TOS generation                   → always Haiku
   | "integration"  // Third-party API wiring           → always Sonnet (Max)
   | "router";      // Lightweight routing decisions    → always Haiku
@@ -95,6 +96,7 @@ export function getLLM(options: LLMFactoryOptions): ChatAnthropic {
     case "architect":
     case "researcher":
     case "integration":
+    case "ui_designer":
       // These nodes always use the flagship Sonnet regardless of tier.
       modelId = SONNET_MODEL;
       maxTokens = MAX_TOKENS_SONNET;
@@ -191,9 +193,13 @@ export const getArchitectLLM = () =>
 export const getCoderLLM = (tier: SubscriptionTier) =>
   getLLM({ role: "coder", tier });
 
-/** Returns the researcher model with Nia context headers attached */
+/** Returns the Researcher model with Nia context headers attached */
 export const getResearcherLLM = () =>
   getLLM({ role: "researcher", tier: "max", withNiaContext: true });
+
+/** Returns the UI Designer model */
+export const getUIDesignerLLM = () =>
+  getLLM({ role: "ui_designer", tier: "max" });
 
 /** Returns the Haiku model for legal document generation */
 export const getLegalLLM = () =>

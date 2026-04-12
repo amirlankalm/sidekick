@@ -62,6 +62,7 @@ import {
   getCoderLLM,
   getResearcherLLM,
   getLegalLLM,
+  getUIDesignerLLM,
 } from "./llm_config";
 
 // ---------------------------------------------------------------------------
@@ -228,12 +229,14 @@ async function researcherNode(
     ? JSON.stringify(state.blueprint, null, 2)
     : `User prompt: ${state.user_prompt}`;
 
-  const systemPrompt = `You are a research agent specialised in Chrome Extension development.
+const systemPrompt = `You are a research agent specialised in Chrome Extension development.
 Given a blueprint, return focused documentation snippets covering:
 - Manifest V3 requirements for the listed permissions
 - Best-practice code patterns for each required feature
 - Any known CSP (Content Security Policy) gotchas
+- Really useful documentations and UI design examples from extension repos indexed in Nia to ensure premium layout.
 
+Filter the Nia context to surface only the most relevant, high-quality documentation.
 Be concise. Return plain text grouped by section headers.`;
 
   const response = await llm.invoke([
@@ -273,17 +276,16 @@ async function coderNode(
 
   const llm = getCoderLLM(state.subscription_tier);
 
-  // ── Build the system prompt ───────────────────────────────────────────────
   const systemPrompt = `You are an expert Chrome Extension engineer.
 Produce a complete, production-ready Manifest V3 extension.
 
 Output ONLY a JSON object where each key is a relative file path and each value is
 the stringified file content.  Example:
 {
-  "manifest.json": "{ \\"manifest_version\\": 3, ... }",
-  "background.js": "// service worker ...",
-  "popup.html": "<!DOCTYPE html>...",
-  "popup.js": "..."
+  "manifest.json": "{\n  \\"manifest_version\\": 3,\n  ... \n}",
+  "background.js": "// service worker ...\n\nconsole.log('test');",
+  "popup.html": "<!DOCTYPE html>\n<html>\n...",
+  "popup.js": "document.addEventListener('DOMContentLoaded', () => {\n  ...\n});"
 }
 
 Rules:
@@ -291,6 +293,7 @@ Rules:
 - Never use eval() or inline scripts (CSP compliance)
 - Service workers must follow MV3 patterns (no persistent background pages)
 - All external requests must use host_permissions declared in the manifest
+- Maintain pristine, highly readable code formatting with correct indentation and newlines in your stringified content. Never minify the code!
 - Output ONLY the JSON map — no markdown fences, no prose`;
 
   // ── Build the user prompt with blueprint + research context + QA errors ──
@@ -339,6 +342,14 @@ Rules:
       .replace(/```\s*$/m, "")
       .trim();
     sourceCode = JSON.parse(cleaned) as SourceCode;
+    
+    // Auto-format any generated JSON files
+    for (const [filename, content] of Object.entries(sourceCode)) {
+      if (filename.endsWith('.json')) {
+        try { sourceCode[filename] = JSON.stringify(JSON.parse(content), null, 2); }
+        catch {}
+      }
+    }
   } catch (err) {
     // ── Fallback: try to extract individual file entries via regex ─────────
     // This rescues truncated responses where the final }" is cut off.
@@ -374,6 +385,99 @@ Rules:
     qa_logs: [],
     qa_retry_count: state.qa_retry_count + (isRetry ? 1 : 0),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Node: ui_designer_node
+// ---------------------------------------------------------------------------
+
+/**
+ * Scans the generated source_code for HTML, CSS, and UI-related files,
+ * then enhances their design to ensure a stunning, modern, and vibrant
+ * appearance using best practices in web design (e.g., dynamic animations,
+ * beautiful typography, and responsive layouts).
+ */
+async function uiDesignerNode(
+  state: ExtensyState
+): Promise<Partial<ExtensyState>> {
+  console.log("[ui_designer_node] Enhancing extension UI/UX design…");
+
+  const llm = getUIDesignerLLM();
+
+  const codeSnapshot = Object.entries(state.source_code)
+    .filter(([filePath]) => filePath.endsWith(".html") || filePath.endsWith(".css") || filePath.endsWith(".js"))
+    .map(([file, content]) => `// === ${file} ===\n${content}`)
+    .join("\n\n");
+
+  const systemPrompt = `You are an elite node UI designer and frontend engineer.
+Review the provided Chrome Extension UI files (HTML/CSS/JS). Your task is to vastly improve the UI aesthetics so it looks stunning, modern, and premium.
+Rules:
+- Give it a vibrant or sleek dark mode feel, maybe use glassmorphism if appropriate.
+- Include dynamic hover effects and micro-animations to make it feel alive.
+- Improve typography (use modern clean sans-serifs) and spacing.
+- Return ONLY a JSON object where each key is a relative file path (same as provided) and each value is the strictly formatted stringified file content.
+- Example: { "popup.html": "...", "popup.css": "..." }
+- Do not remove any functionality or data bindings. Only ENHANCE the styles and structure.
+- If a file doesn't need UI enhancement (e.g. background worker), omit it or return it unmodified.
+- Output ONLY the JSON map — no markdown fences, no prose.`;
+
+  const response = await llm.invoke([
+    new SystemMessage(systemPrompt),
+    new HumanMessage(
+      `Enhance the UI of the following extension code:\n\n${codeSnapshot}`
+    ),
+  ]);
+
+  const raw =
+    typeof response.content === "string"
+      ? response.content
+      : JSON.stringify(response.content);
+
+  let uiFiles: SourceCode = {};
+  try {
+    const cleaned = raw
+      .replace(/^```(?:json)?\s*/m, "")
+      .replace(/```\s*$/m, "")
+      .trim();
+    if (cleaned !== "{}") {
+      uiFiles = JSON.parse(cleaned) as SourceCode;
+    }
+  } catch (err) {
+    console.warn("[ui_designer_node] Could not parse UI designer output. Attempting partial extraction.", err);
+    const partialFiles: SourceCode = {};
+    const filePattern = /"([^"]+\.(?:js|ts|html|css|json|md|txt|svg|png))"\s*:\s*"((?:[^"\\]|\\.)*)"/gs;
+    let match: RegExpExecArray | null;
+    while ((match = filePattern.exec(raw)) !== null) {
+      const [, filename, content] = match;
+      partialFiles[filename] = content.replace(/\\n/g, "\n").replace(/\\t/g, "\t").replace(/\\\\/g, "\\").replace(/\\"/g, '"');
+    }
+    if (Object.keys(partialFiles).length > 0) {
+      uiFiles = partialFiles;
+    }
+  }
+
+  console.log(
+    `[ui_designer_node] Enhanced ${Object.keys(uiFiles).length} UI file(s): ${Object.keys(uiFiles).join(", ")}`
+  );
+
+  return {
+    source_code: { ...state.source_code, ...uiFiles },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Router: ui_designer_router
+// ---------------------------------------------------------------------------
+
+function uiDesignerRouterFn(
+  state: ExtensyState
+): "ui_designer_node" | "qa_node" {
+  if (state.subscription_tier === "free") {
+    console.log("[router/ui_designer] Free tier → qa_node directly");
+    return "qa_node";
+  }
+  console.log("[router/ui_designer] Pro/Max tier → ui_designer_node");
+  return "ui_designer_node";
 }
 
 // ---------------------------------------------------------------------------
@@ -758,6 +862,7 @@ function buildGraph() {
   graph.addNode("architect_node", architectNode);
   graph.addNode("researcher_node", researcherNode);
   graph.addNode("coder_node", coderNode);
+  graph.addNode("ui_designer_node", uiDesignerNode);
   graph.addNode("qa_node", qaNode);
   graph.addNode("legal_node", legalNode);
   graph.addNode("integration_node", integrationNode);
@@ -779,8 +884,11 @@ function buildGraph() {
   // ── researcher_node → coder_node ─────────────────────────────────────────
   g.addEdge("researcher_node", "coder_node");
 
-  // ── coder_node → qa_node ─────────────────────────────────────────────────
-  g.addEdge("coder_node", "qa_node");
+  // ── coder_node → ui_designer_router ──────────────────────────────────────
+  g.addConditionalEdges("coder_node", uiDesignerRouterFn);
+
+  // ── ui_designer_node → qa_node ───────────────────────────────────────────
+  g.addEdge("ui_designer_node", "qa_node");
 
   // ── qa_node → qa router (retry loop or proceed) ──────────────────────────
   g.addConditionalEdges("qa_node", qaRouterFn);
