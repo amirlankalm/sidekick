@@ -11,7 +11,7 @@
 
 [![Powered by LangGraph](https://img.shields.io/badge/Orchestrator-LangGraph-darkgreen?style=for-the-badge&logo=langchain)](https://langchain-ai.github.io/langgraph/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5-3178C6?style=for-the-badge&logo=typescript)](https://typescriptlang.org)
-[![Anthropic Claude](https://img.shields.io/badge/AI-Claude_3.5-FF3B7A?style=for-the-badge&logo=anthropic)](https://anthropic.com)
+[![Anthropic Claude](https://img.shields.io/badge/AI-Claude_4.5-FF3B7A?style=for-the-badge&logo=anthropic)](https://anthropic.com)
 [![Playwright QA](https://img.shields.io/badge/Testing-Playwright-2EAD33?style=for-the-badge&logo=playwright)](https://playwright.dev)
 
 </div>
