@@ -64,6 +64,7 @@ import {
   getResearcherLLM,
   getLegalLLM,
   getUIDesignerLLM,
+  getDecomposerLLM,
 } from "./llm_config";
 
 // ---------------------------------------------------------------------------
@@ -164,6 +165,7 @@ Given a user prompt, produce a STRICT JSON object that conforms to this schema:
   "permissions": string[],
   "host_permissions": string[],
   "features": [{ "id": string, "summary": string, "implementation_hint": string }],
+  "design_profile": string, // e.g. "Apple Minimalist", "Linear Dark Mode", or "Stripe Vibrant" (auto-select best fit based on extension type)
   "raw_requirements": string
 }
 Respond with ONLY the JSON object — no markdown fences, no prose.`;
@@ -199,62 +201,205 @@ Respond with ONLY the JSON object — no markdown fences, no prose.`;
 function researchRouterFn(
   state: ExtensyState
 ): "researcher_node" | "coder_node" {
-  if (state.subscription_tier === "max") {
-    // Max tier always gets external context from Nia before coding.
-    console.log("[router/research] Max tier → researcher_node");
+  if (state.subscription_tier === "max" || state.subscription_tier === "pro") {
+    // Pro & Max both get deep web + Nia research context before coding.
+    // Max additionally gets a full Synthesis pass (Phase 5).
+    console.log(`[router/research] ${state.subscription_tier} tier → researcher_node`);
     return "researcher_node";
   }
-  console.log("[router/research] Non-Max → coder_node");
+  console.log("[router/research] Free tier → coder_node (no research)");
   return "coder_node";
 }
 
 // ---------------------------------------------------------------------------
-// Node: researcher_node (Max tier only)
+// Helper: fetch and strip a documentation web page to plain text
 // ---------------------------------------------------------------------------
 
 /**
- * Queries the Nia context API via Anthropic headers.
- * The NIA_API_KEY is forwarded as a custom header (see llm_config.ts).
- * In practice, researcher_node constructs a retrieval prompt that asks the
- * model to surface relevant Chrome Extension API documentation snippets
- * for the blueprint's required permissions.
+ * Fetches a public URL, strips all HTML/script/style tags, collapses whitespace,
+ * and truncates to `maxChars` to avoid blowing the context window.
+ * Uses AbortSignal.timeout so it never hangs the pipeline.
+ */
+async function fetchDocPage(url: string, maxChars = 12000): Promise<string> {
+  try {
+    const res = await fetch(url, {
+      signal: AbortSignal.timeout(9000),
+      headers: { "User-Agent": "Extensy-Sidekick-Researcher/1.0" },
+    });
+    if (!res.ok) {
+      console.warn(`[researcher/fetch] ${url} returned HTTP ${res.status} — skipping`);
+      return "";
+    }
+    const html = await res.text();
+    const stripped = html
+      .replace(/<script[\s\S]*?<\/script>/gi, "")
+      .replace(/<style[\s\S]*?<\/style>/gi, "")
+      .replace(/<!--[\s\S]*?-->/g, "")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, maxChars);
+    console.log(`[researcher/fetch] ✓ ${url} → ${stripped.length} chars`);
+    return `--- Source: ${url} ---\n${stripped}`;
+  } catch (err) {
+    console.warn(`[researcher/fetch] ✗ ${url} failed: ${String(err)}`);
+    return "";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Node: researcher_node (Pro + Max tier)
+// ---------------------------------------------------------------------------
+
+/**
+ * Super Researcher — a 5-phase pipeline that deeply understands the extension
+ * requirements by decomposing the prompt, fetching real documentation, and
+ * combining it with Nia indexed context into a rich research brief.
+ *
+ * Phase 1 (haiku): Decompose blueprint → specific research questions
+ * Phase 2 (haiku): Map questions → authoritative documentation URLs
+ * Phase 3 (fetch): Parallel-fetch all URLs, strip to plain text
+ * Phase 4 (sonnet + Nia): Semantic recall from Nia indexed repos
+ * Phase 5 (sonnet, Max only): Synthesize all into a structured research brief
+ *
+ * Pro  = Phases 1-4 (raw context chunks)
+ * Max  = Phases 1-5 (fully synthesized, structured brief)
  */
 async function researcherNode(
   state: ExtensyState
 ): Promise<Partial<ExtensyState>> {
-  console.log("[researcher_node] Fetching Nia context for blueprint…");
+  console.log(`[researcher_node] Starting deep research (tier=${state.subscription_tier})…`);
 
-  const llm = getResearcherLLM(); // Sonnet + NIA_API_KEY header
+  const decomposerLLM  = getDecomposerLLM();   // claude-haiku-4-5 — fast & cheap
+  const researcherLLM  = getResearcherLLM();    // claude-sonnet-4-5 + NIA_API_KEY
+  const synthesizerLLM = getArchitectLLM();     // claude-sonnet-4-5 for synthesis
 
-  const blueprint = state.blueprint
+  const blueprintJson = state.blueprint
     ? JSON.stringify(state.blueprint, null, 2)
     : `User prompt: ${state.user_prompt}`;
 
-const systemPrompt = `You are a research agent specialised in Chrome Extension development.
-Given a blueprint, return focused documentation snippets covering:
-- Manifest V3 requirements for the listed permissions
-- Best-practice code patterns for each required feature
-- Any known CSP (Content Security Policy) gotchas
-- Really useful documentations and UI design examples from extension repos indexed in Nia to ensure premium layout.
+  const designProfile = state.blueprint?.design_profile || "Premium Dark Mode";
 
-Filter the Nia context to surface only the most relevant, high-quality documentation.
-Be concise. Return plain text grouped by section headers.`;
+  // ── Phase 1: Decompose → Research Questions ─────────────────────────────
+  console.log("[researcher_node] Phase 1 — Decomposing into research questions…");
 
-  const response = await llm.invoke([
-    new SystemMessage(systemPrompt),
-    new HumanMessage(`Research the following extension blueprint:\n\n${blueprint}`),
+  const p1Response = await decomposerLLM.invoke([
+    new SystemMessage(`You are a Chrome Extension research planner.
+Given a blueprint, output a NUMBERED LIST (1-5 items, plain text) of the most specific, targeted research questions that need to be answered to implement this extension correctly.
+Focus on: Chrome MV3 APIs, third-party API endpoints, auth flows, and CSP constraints.
+Return ONLY the numbered list, no prose, no headers.`),
+    new HumanMessage(`Generate targeted research questions for this extension blueprint:\n\n${blueprintJson}`),
   ]);
 
-  const context =
-    typeof response.content === "string"
-      ? response.content
-      : JSON.stringify(response.content);
+  const researchQuestions = typeof p1Response.content === "string"
+    ? p1Response.content
+    : JSON.stringify(p1Response.content);
+  console.log(`[researcher_node] Phase 1 ✓ — ${researchQuestions.split("\n").length} questions`);
 
-  console.log(
-    `[researcher_node] Retrieved ${context.length} chars of context`
+  // ── Phase 2: Map Questions → Documentation URLs ──────────────────────────
+  console.log("[researcher_node] Phase 2 — Mapping questions to documentation URLs…");
+
+  const p2Response = await decomposerLLM.invoke([
+    new SystemMessage(`You are a Chrome Extension documentation specialist.
+Given a list of research questions, output a PLAIN LIST of 3-8 authoritative, publicly accessible documentation URLs that directly answer those questions.
+Prefer: developer.chrome.com, official API docs (docs.github.com, developers.notion.com, etc.), MDN.
+Return ONLY one URL per line — no prose, no numbering, no markdown.`),
+    new HumanMessage(`Find documentation URLs for these research questions:\n\n${researchQuestions}`),
+  ]);
+
+  const urlBlock = typeof p2Response.content === "string"
+    ? p2Response.content
+    : JSON.stringify(p2Response.content);
+
+  const docUrls = urlBlock
+    .split("\n")
+    .map(l => l.trim())
+    .filter(l => l.startsWith("http"))
+    .slice(0, 8); // cap at 8 pages
+
+  console.log(`[researcher_node] Phase 2 ✓ — ${docUrls.length} URLs identified: ${docUrls.join(", ")}`);
+
+  // ── Phase 3: Parallel Web Fetch ──────────────────────────────────────────
+  console.log(`[researcher_node] Phase 3 — Fetching ${docUrls.length} documentation pages…`);
+
+  const fetchResults = await Promise.allSettled(
+    docUrls.map(url => fetchDocPage(url))
   );
-  return { research_context: context };
+
+  const webContent = fetchResults
+    .filter((r): r is PromiseFulfilledResult<string> => r.status === "fulfilled" && r.value.length > 0)
+    .map(r => r.value)
+    .join("\n\n");
+
+  console.log(`[researcher_node] Phase 3 ✓ — Retrieved ${webContent.length} total chars from web`);
+
+  // ── Phase 4: Nia Semantic Recall ─────────────────────────────────────────
+  console.log("[researcher_node] Phase 4 — Pulling context from Nia…");
+
+  const p4Response = await researcherLLM.invoke([
+    new SystemMessage(`You are a Nia context retrieval agent.
+Using your Nia knowledge base, surface ONLY what is directly relevant to the request.
+Do not invent or generalize. Return exact design tokens, code patterns, and API snippets found in Nia.
+Return plain text grouped by clear section headers.`),
+    new HumanMessage(
+      `Retrieve from Nia:\n` +
+      `1. "Chrome Extension Manifest V3 best practices and API patterns"\n` +
+      `2. "${designProfile} design profile: exact Tailwind tokens, padding scale, colors, border radius"\n` +
+      `3. "Google Font imports, inline SVG usage, and micro-interaction CSS for premium extensions"\n\n` +
+      `Blueprint context:\n${blueprintJson}`
+    ),
+  ]);
+
+  const niaContext = typeof p4Response.content === "string"
+    ? p4Response.content
+    : JSON.stringify(p4Response.content);
+
+  console.log(`[researcher_node] Phase 4 ✓ — Nia returned ${niaContext.length} chars`);
+
+  // ── Phase 5: Synthesize (Max-tier only) ──────────────────────────────────
+  if (state.subscription_tier !== "max") {
+    // Pro tier: pass raw web content + Nia data directly to coder as research context
+    const rawContext = [
+      "## Research Questions\n" + researchQuestions,
+      "## Documentation URLs Consulted\n" + docUrls.join("\n"),
+      "## Web Documentation Content\n" + (webContent || "(no pages fetched)"),
+      "## Nia Design & API Context\n" + niaContext,
+    ].join("\n\n---\n\n");
+
+    console.log(`[researcher_node] Phase 5 skipped (Pro tier) — passing raw context (${rawContext.length} chars)`);
+    return { research_context: rawContext };
+  }
+
+  console.log("[researcher_node] Phase 5 — Synthesizing research brief (Max tier)…");
+
+  const p5Response = await synthesizerLLM.invoke([
+    new SystemMessage(`You are a senior Chrome Extension research analyst.
+Synthesize the provided web documentation content and Nia design context into a clean, structured research brief.
+This brief will be consumed by a coder and a UI designer in separate nodes, so be precise and actionable.
+
+Structure your output with these exact sections:
+## Chrome API Patterns & MV3 Rules
+## Third-Party API Integration Guide
+## CSP & Security Constraints
+## UI Design System Tokens (from Nia)
+## Implementation Gotchas
+
+Be specific. Include real endpoint paths, exact CSS classes, real permission names. No filler prose.`),
+    new HumanMessage(
+      `## Research Questions\n${researchQuestions}\n\n` +
+      `## Web Documentation Fetched\n${webContent || "(no pages fetched)"}\n\n` +
+      `## Nia Design & API Context\n${niaContext}`
+    ),
+  ]);
+
+  const synthesizedBrief = typeof p5Response.content === "string"
+    ? p5Response.content
+    : JSON.stringify(p5Response.content);
+
+  console.log(`[researcher_node] Phase 5 ✓ — Synthesized brief: ${synthesizedBrief.length} chars`);
+  return { research_context: synthesizedBrief };
 }
+
 
 // ---------------------------------------------------------------------------
 // Node: coder_node
@@ -410,23 +555,28 @@ async function uiDesignerNode(
     .map(([file, content]) => `// === ${file} ===\n${content}`)
     .join("\n\n");
 
-  const systemPrompt = `You are an elite node UI designer and frontend engineer.
-Review the provided Chrome Extension UI files (HTML/CSS/JS). Your task is to vastly improve the UI aesthetics so it looks stunning, modern, and premium.
-Rules:
-- Give it a vibrant or sleek dark mode feel, maybe use glassmorphism if appropriate.
-- Include dynamic hover effects and micro-animations to make it feel alive.
-- Improve typography (use modern clean sans-serifs) and spacing.
-- Return ONLY a JSON object where each key is a relative file path (same as provided) and each value is the strictly formatted stringified file content.
-- Example: { "popup.html": "...", "popup.css": "..." }
-- Do not remove any functionality or data bindings. Only ENHANCE the styles and structure.
-- If a file doesn't need UI enhancement (e.g. background worker), omit it or return it unmodified.
-- Output ONLY the JSON map — no markdown fences, no prose.`;
+  const systemPrompt = `You are an elite Chrome Extension UI designer.
+Your task is to completely eliminate generic 'vibecoded' UI and apply a highly structured, premium aesthetic based on the provided design profile and research context.
+
+Strict Design Rules:
+1. DESIGN PROFILE: You must strictly apply the "${state.blueprint?.design_profile || 'Premium Minimalist'}" design profile.
+2. RESEARCH CONTEXT: Use the exact color codes, Tailwind padding tokens, and border radii provided in the Nia Design Inspiration context below. Do not guess arbitrary values.
+3. FOUNDATION: Always inject a modern Google Font (e.g. Inter, Outfit, Plus Jakarta Sans). Use high-quality inline SVGs configured with \`currentColor\`—do NOT use emojis for icons.
+4. MICRO-INTERACTIONS: Every interactive element must feel alive but controlled. Use exact transitions: \`transition-all duration-200 hover:scale-[1.02] active:scale-[0.98]\` for buttons. Use \`hover:bg-white/5 hover:border-white/10\` for cards. Use clear focus rings (\`focus:ring-2 focus:outline-none\`).
+5. SPACING: Use a strict 4-point spacing scale. Avoid random padding like \`p-3\` and \`p-5\`. Standardize containers to \`p-4\` and gaps to \`gap-4\`.
+
+Return ONLY a JSON object where each key is a relative file path (same as provided) and each value is the strictly formatted stringified file content.
+Example: { "popup.html": "...", "popup.css": "..." }
+Do not remove functionality or data bindings. Only ENHANCE the styles and structure.
+Output ONLY the JSON map — no markdown fences, no prose.`;
+
+  const userMessageContent = state.research_context 
+    ? `Nia Design Inspiration Context:\n${state.research_context}\n\nEnhance the UI of the following extension code:\n\n${codeSnapshot}`
+    : `Enhance the UI of the following extension code:\n\n${codeSnapshot}`;
 
   const response = await llm.invoke([
     new SystemMessage(systemPrompt),
-    new HumanMessage(
-      `Enhance the UI of the following extension code:\n\n${codeSnapshot}`
-    ),
+    new HumanMessage(userMessageContent),
   ]);
 
   const raw =

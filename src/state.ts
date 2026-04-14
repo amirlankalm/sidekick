@@ -35,6 +35,8 @@ export interface Blueprint {
     summary: string;
     implementation_hint?: string;
   }>;
+  /** Design profile the extension UI should follow (e.g., Apple Minimalist, Linear Dark, Stripe Vibrant) */
+  design_profile?: string;
   /** Raw requirements text preserved for downstream debugging */
   raw_requirements: string;
 }

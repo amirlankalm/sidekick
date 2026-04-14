@@ -208,3 +208,11 @@ export const getLegalLLM = () =>
 /** Returns the Haiku model for lightweight routing decisions */
 export const getRouterLLM = () =>
   getLLM({ role: "router", tier: "free" });
+
+/**
+ * Returns claude-haiku-4-5 for fast, cheap decomposition tasks
+ * (Phase 1 & 2 of the super researcher: breaking prompts into questions
+ * and mapping them to documentation URLs).
+ */
+export const getDecomposerLLM = () =>
+  getLLM({ role: "router", tier: "free", temperature: 0.1 });
