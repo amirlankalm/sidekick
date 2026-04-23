@@ -21,22 +21,36 @@ import { buildGraph } from "./graph";
 import type { ExtensyState } from "./state";
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
+
+const ALLOWED_ORIGIN_SUFFIXES = [".extensy.app", ".vercel.app"];
+
+function isAllowedOrigin(origin: string): boolean {
+  if (!origin) return false;
+
+  try {
+    const parsed = new URL(origin);
+    if (process.env.NODE_ENV !== "production") {
+      return true;
+    }
+
+    if (["http://localhost:3000", "http://localhost:3001", "https://extensy.app"].includes(origin)) {
+      return true;
+    }
+
+    return ALLOWED_ORIGIN_SUFFIXES.some((suffix) => parsed.hostname.endsWith(suffix));
+  } catch {
+    return false;
+  }
+}
 
 // ── CORS: allow Extensy frontend and sidekick.extensy.dev ─────────────────
 app.use((req, res, next) => {
   const origin = req.headers.origin ?? "";
-  // Allow localhost, all extensy.app subdomains, and Vercel preview URLs
-  const isAllowed =
-    origin === "http://localhost:3000" ||
-    origin === "http://localhost:3001" ||
-    origin.endsWith(".extensy.app") ||
-    origin === "https://extensy.app" ||
-    origin.endsWith(".vercel.app") ||   // Vercel preview deployments
-    process.env.NODE_ENV !== "production";
 
-  if (isAllowed) {
-    res.setHeader("Access-Control-Allow-Origin", origin || "*");
+  if (isAllowedOrigin(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
   }
   res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
@@ -71,6 +85,11 @@ app.post("/generate", async (req: Request, res: Response) => {
     return;
   }
 
+  if (!["free", "pro", "max"].includes(subscription_tier)) {
+    res.status(400).json({ error: "subscription_tier must be free, pro, or max" });
+    return;
+  }
+
   // ── Set up SSE headers ────────────────────────────────────────────────────
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
@@ -88,6 +107,7 @@ app.post("/generate", async (req: Request, res: Response) => {
     researcher_node:   "Fetching Chrome Extension docs...",
     coder_node:        "Writing extension code...",
     qa_node:           "Running QA tests in Chromium...",
+    devtools_node:     "Performing deep DevTools diagnostics...",
     fan_out_router:    "Preparing final steps...",
     legal_node:        "Generating Terms of Service...",
     integration_node:  "Wiring third-party integrations...",
@@ -100,11 +120,11 @@ app.post("/generate", async (req: Request, res: Response) => {
     // Stream node-level events by subscribing to graph events
     const stream = graph.streamEvents(
       {
-        user_prompt: prompt,
+        user_prompt: prompt.trim(),
         subscription_tier,
         planning_mode,
-        author,
-        tos_id,
+        author: author.trim().slice(0, 120),
+        tos_id: tos_id.trim().slice(0, 120),
       } as Partial<ExtensyState>,
       { version: "v2" }
     );

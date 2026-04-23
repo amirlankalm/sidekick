@@ -41,6 +41,7 @@ import "dotenv/config";
 import path from "path";
 import fs from "fs/promises";
 import os from "os";
+import net from "net";
 import * as crypto from "crypto";
 // Use @sparticuz/chromium on Vercel (serverless), local Playwright elsewhere.
 // We always import from playwright-core (no bundled browser binary).
@@ -66,6 +67,7 @@ import {
   getUIDesignerLLM,
   getDecomposerLLM,
 } from "./llm_config";
+import { runDevToolsDiagnostics } from "./devtools_mcp";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -79,6 +81,18 @@ const TMP_EXT_DIR = path.join(os.tmpdir(), "sidekick", "extension");
 
 /** Where the assembled ZIP is written (local dev only; skipped on Vercel) */
 const OUTPUT_DIR = path.join(os.tmpdir(), "sidekick", "output");
+const ALLOWED_DOC_HOSTS = new Set([
+  "developer.chrome.com",
+  "chrome.jscn.org",
+  "developer.mozilla.org",
+  "docs.github.com",
+  "docs.stripe.com",
+  "platform.openai.com",
+  "developers.notion.com",
+  "supabase.com",
+  "docs.supabase.com",
+]);
+type ConnectorKind = "supabase" | "stripe";
 
 // ---------------------------------------------------------------------------
 // Supabase client (used by legal_node to persist the TOS document)
@@ -105,12 +119,14 @@ function getSupabaseClient() {
  * always test the freshest generated code.
  */
 async function writeExtensionToDisk(sourceCode: SourceCode): Promise<void> {
-  // Ensure base directory exists.
   await fs.mkdir(TMP_EXT_DIR, { recursive: true });
 
   for (const [relativePath, content] of Object.entries(sourceCode)) {
-    const absolute = path.join(TMP_EXT_DIR, relativePath);
-    // Create nested directories (e.g. src/background.js).
+    const normalizedPath = path.normalize(relativePath).replace(/^(\.\.(\/|\\|$))+/, "");
+    const absolute = path.resolve(TMP_EXT_DIR, normalizedPath);
+    if (!absolute.startsWith(`${TMP_EXT_DIR}${path.sep}`) && absolute !== TMP_EXT_DIR) {
+      throw new Error(`[graph] Refusing to write file outside extension root: ${relativePath}`);
+    }
     await fs.mkdir(path.dirname(absolute), { recursive: true });
     await fs.writeFile(absolute, content, "utf-8");
   }
@@ -118,6 +134,339 @@ async function writeExtensionToDisk(sourceCode: SourceCode): Promise<void> {
   console.log(
     `[graph] Wrote ${Object.keys(sourceCode).length} file(s) to ${TMP_EXT_DIR}`
   );
+}
+
+function detectRequiredConnectors(state: ExtensyState): ConnectorKind[] {
+  const fromBlueprint = state.blueprint?.connectors ?? [];
+  const haystack = [
+    state.user_prompt,
+    state.blueprint?.description,
+    state.blueprint?.raw_requirements,
+    state.research_context,
+    ...Object.values(state.source_code),
+  ]
+    .filter(Boolean)
+    .join("\n")
+    .toLowerCase();
+
+  const connectors = new Set<ConnectorKind>(
+    fromBlueprint.filter((connector): connector is ConnectorKind =>
+      connector === "supabase" || connector === "stripe"
+    )
+  );
+
+  if (
+    /\bsupabase\b/.test(haystack) ||
+    /\b(auth|sign in|signin|sign up|signup|session|user account|database|postgres|table|row level security|rls)\b/.test(haystack)
+  ) {
+    connectors.add("supabase");
+  }
+
+  if (
+    /\bstripe\b/.test(haystack) ||
+    /\b(payment|payments|checkout|subscription|billing|purchase|paywall|premium plan)\b/.test(haystack)
+  ) {
+    connectors.add("stripe");
+  }
+
+  return [...connectors];
+}
+
+function buildConnectorFiles(connectors: ConnectorKind[]): SourceCode {
+  if (connectors.length === 0) return {};
+
+  const files: SourceCode = {
+    "lib/extensy-connectors/config.js": `// REQUIRES_API_KEY: NEXT_PUBLIC_SUPABASE_URL - Supabase project URL for auth and database requests
+// REQUIRES_API_KEY: NEXT_PUBLIC_SUPABASE_ANON_KEY - Supabase anon key used by the extension client
+// REQUIRES_API_KEY: STRIPE_PUBLISHABLE_KEY - Stripe publishable key used for client-side checkout flows
+// REQUIRES_API_KEY: STRIPE_PAYMENT_LINK - Optional Stripe payment link for instant hosted checkout
+// REQUIRES_API_KEY: STRIPE_CHECKOUT_URL - Optional backend endpoint that creates a Stripe Checkout Session
+export const CONNECTOR_CONFIG = {
+  supabaseUrl: "__NEXT_PUBLIC_SUPABASE_URL__",
+  supabaseAnonKey: "__NEXT_PUBLIC_SUPABASE_ANON_KEY__",
+  stripePublishableKey: "__STRIPE_PUBLISHABLE_KEY__",
+  stripePaymentLink: "__STRIPE_PAYMENT_LINK__",
+  stripeCheckoutUrl: "__STRIPE_CHECKOUT_URL__",
+};
+
+export function readConnectorConfig(overrides = {}) {
+  return {
+    ...CONNECTOR_CONFIG,
+    ...overrides,
+  };
+}
+`,
+    "SETUP_CONNECTORS.md": `# Extensy Connectors
+
+This extension includes first-party Extensy connector scaffolding.
+
+## Supabase
+- Set NEXT_PUBLIC_SUPABASE_URL to your project URL
+- Set NEXT_PUBLIC_SUPABASE_ANON_KEY to your anon key
+- Use the provided Supabase connector for auth, session storage, and PostgREST queries
+
+## Stripe
+- Set STRIPE_PUBLISHABLE_KEY to your Stripe publishable key
+- For the fastest setup, set STRIPE_PAYMENT_LINK to a hosted Stripe Payment Link
+- If you need dynamic pricing, set STRIPE_CHECKOUT_URL to your own backend endpoint that creates Checkout Sessions
+
+## Security Rules
+- Never place a Stripe secret key in the extension
+- Never place a Supabase service role key in the extension
+- Keep privileged billing logic on your backend or in Supabase Edge Functions
+`,
+  };
+
+  if (connectors.includes("supabase")) {
+    files["lib/extensy-connectors/supabase.js"] = `import { readConnectorConfig } from "./config.js";
+
+const SESSION_KEY = "extensy.supabase.session";
+
+async function getStorageArea() {
+  if (typeof chrome !== "undefined" && chrome.storage?.local) {
+    return chrome.storage.local;
+  }
+  return null;
+}
+
+async function readStoredSession() {
+  const storage = await getStorageArea();
+  if (storage) {
+    const data = await storage.get(SESSION_KEY);
+    return data[SESSION_KEY] ?? null;
+  }
+  const raw = globalThis.localStorage?.getItem(SESSION_KEY);
+  return raw ? JSON.parse(raw) : null;
+}
+
+async function writeStoredSession(session) {
+  const storage = await getStorageArea();
+  if (storage) {
+    await storage.set({ [SESSION_KEY]: session });
+    return;
+  }
+  if (session) {
+    globalThis.localStorage?.setItem(SESSION_KEY, JSON.stringify(session));
+  } else {
+    globalThis.localStorage?.removeItem(SESSION_KEY);
+  }
+}
+
+function createHeaders(accessToken) {
+  const { supabaseAnonKey } = readConnectorConfig();
+  return {
+    apikey: supabaseAnonKey,
+    Authorization: accessToken ? \`Bearer \${accessToken}\` : \`Bearer \${supabaseAnonKey}\`,
+    "Content-Type": "application/json",
+  };
+}
+
+export function createSupabaseConnector(overrides = {}) {
+  const config = readConnectorConfig(overrides);
+  const baseUrl = config.supabaseUrl.replace(/\\/$/, "");
+
+  async function request(path, init = {}) {
+    const session = await readStoredSession();
+    const response = await fetch(\`\${baseUrl}\${path}\`, {
+      ...init,
+      headers: {
+        ...createHeaders(session?.access_token),
+        ...(init.headers ?? {}),
+      },
+    });
+
+    const text = await response.text();
+    const data = text ? JSON.parse(text) : null;
+    if (!response.ok) {
+      throw new Error(data?.msg || data?.error_description || data?.message || "Supabase request failed");
+    }
+    return data;
+  }
+
+  return {
+    async signUp({ email, password, metadata = {} }) {
+      return request("/auth/v1/signup", {
+        method: "POST",
+        body: JSON.stringify({ email, password, data: metadata }),
+      });
+    },
+    async signIn({ email, password }) {
+      const session = await request("/auth/v1/token?grant_type=password", {
+        method: "POST",
+        body: JSON.stringify({ email, password }),
+      });
+      await writeStoredSession(session);
+      return session;
+    },
+    async signOut() {
+      const session = await readStoredSession();
+      if (session?.access_token) {
+        await request("/auth/v1/logout", { method: "POST" });
+      }
+      await writeStoredSession(null);
+    },
+    async getSession() {
+      return readStoredSession();
+    },
+    async select(table, query = "") {
+      return request(\`/rest/v1/\${table}\${query}\`, {
+        method: "GET",
+        headers: { Prefer: "return=representation" },
+      });
+    },
+    async insert(table, values) {
+      return request(\`/rest/v1/\${table}\`, {
+        method: "POST",
+        headers: { Prefer: "return=representation" },
+        body: JSON.stringify(values),
+      });
+    },
+    async upsert(table, values, onConflict) {
+      const query = onConflict ? \`?on_conflict=\${encodeURIComponent(onConflict)}\` : "";
+      return request(\`/rest/v1/\${table}\${query}\`, {
+        method: "POST",
+        headers: {
+          Prefer: "resolution=merge-duplicates,return=representation",
+        },
+        body: JSON.stringify(values),
+      });
+    },
+  };
+}
+`;
+  }
+
+  if (connectors.includes("stripe")) {
+    files["lib/extensy-connectors/stripe.js"] = `import { readConnectorConfig } from "./config.js";
+
+export function createStripeConnector(overrides = {}) {
+  const config = readConnectorConfig(overrides);
+
+  function assertClientConfig() {
+    if (!config.stripePublishableKey || config.stripePublishableKey === "YOUR_API_KEY_HERE") {
+      throw new Error("Missing STRIPE_PUBLISHABLE_KEY");
+    }
+  }
+
+  return {
+    async startCheckout({ priceId, successUrl, cancelUrl, customerEmail, metadata = {} } = {}) {
+      assertClientConfig();
+
+      if (config.stripePaymentLink && config.stripePaymentLink !== "YOUR_API_KEY_HERE") {
+        const target = new URL(config.stripePaymentLink);
+        if (successUrl) target.searchParams.set("redirect_status", "succeeded");
+        await chrome.tabs.create({ url: target.toString() });
+        return { mode: "payment_link", url: target.toString() };
+      }
+
+      if (!config.stripeCheckoutUrl || config.stripeCheckoutUrl === "YOUR_API_KEY_HERE") {
+        throw new Error("Set STRIPE_PAYMENT_LINK or STRIPE_CHECKOUT_URL before starting checkout");
+      }
+
+      const response = await fetch(config.stripeCheckoutUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Stripe-Publishable-Key": config.stripePublishableKey,
+        },
+        body: JSON.stringify({
+          priceId,
+          successUrl,
+          cancelUrl,
+          customerEmail,
+          metadata,
+        }),
+      });
+
+      const data = await response.json().catch(() => null);
+      if (!response.ok) {
+        throw new Error(data?.error || "Stripe checkout initialization failed");
+      }
+
+      if (!data?.url) {
+        throw new Error("Stripe checkout response did not include a redirect URL");
+      }
+
+      await chrome.tabs.create({ url: data.url });
+      return { mode: "checkout_session", url: data.url };
+    },
+  };
+}
+`;
+  }
+
+  return files;
+}
+
+function patchManifestForConnectors(sourceCode: SourceCode, connectors: ConnectorKind[]): SourceCode {
+  if (connectors.length === 0 || !sourceCode["manifest.json"]) return sourceCode;
+
+  try {
+    const manifest = JSON.parse(sourceCode["manifest.json"]) as {
+      permissions?: string[];
+      host_permissions?: string[];
+      content_security_policy?: Record<string, string>;
+    };
+
+    const permissions = new Set(manifest.permissions ?? []);
+    const hostPermissions = new Set(manifest.host_permissions ?? []);
+
+    permissions.add("storage");
+
+    if (connectors.includes("supabase")) {
+      hostPermissions.add("https://*.supabase.co/*");
+    }
+
+    if (connectors.includes("stripe")) {
+      hostPermissions.add("https://checkout.stripe.com/*");
+      hostPermissions.add("https://buy.stripe.com/*");
+    }
+
+    manifest.permissions = [...permissions];
+    manifest.host_permissions = [...hostPermissions];
+
+    return {
+      ...sourceCode,
+      "manifest.json": JSON.stringify(manifest, null, 2),
+    };
+  } catch {
+    return sourceCode;
+  }
+}
+
+function buildConnectorPrompt(connectors: ConnectorKind[]): string {
+  if (connectors.length === 0) return "";
+
+  const sections: string[] = [
+    "## Extensy Connector Contract",
+    "When auth, database, or payment features are required, use the first-party Extensy connector modules instead of inventing ad hoc integration code.",
+  ];
+
+  if (connectors.includes("supabase")) {
+    sections.push(
+      [
+        "### Supabase",
+        '- Import from `./lib/extensy-connectors/supabase.js` or `../lib/extensy-connectors/supabase.js` depending on file location',
+        "- Use `createSupabaseConnector()` for sign-up, sign-in, session reads, and table CRUD",
+        "- Never place a Supabase service role key in the extension",
+        "- If auth is required, build real login and error states around this connector",
+      ].join("\n")
+    );
+  }
+
+  if (connectors.includes("stripe")) {
+    sections.push(
+      [
+        "### Stripe",
+        '- Import from `./lib/extensy-connectors/stripe.js` or `../lib/extensy-connectors/stripe.js` depending on file location',
+        "- Use `createStripeConnector()` to launch checkout flows",
+        "- Never place a Stripe secret key in the extension",
+        "- Prefer Stripe Payment Links for zero-backend checkout; otherwise call a backend `STRIPE_CHECKOUT_URL` endpoint",
+      ].join("\n")
+    );
+  }
+
+  return sections.join("\n\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -166,6 +515,7 @@ Given a user prompt, produce a STRICT JSON object that conforms to this schema:
   "host_permissions": string[],
   "features": [{ "id": string, "summary": string, "implementation_hint": string }],
   "design_profile": string, // e.g. "Apple Minimalist", "Linear Dark Mode", or "Stripe Vibrant" (auto-select best fit based on extension type)
+  "connectors": ["supabase" | "stripe"], // include only if auth, database, or payments are required
   "raw_requirements": string
 }
 Respond with ONLY the JSON object — no markdown fences, no prose.`;
@@ -222,6 +572,12 @@ function researchRouterFn(
  */
 async function fetchDocPage(url: string, maxChars = 12000): Promise<string> {
   try {
+    const parsedUrl = new URL(url);
+    if (parsedUrl.protocol !== "https:" || !ALLOWED_DOC_HOSTS.has(parsedUrl.hostname)) {
+      console.warn(`[researcher/fetch] Blocked unsupported documentation URL: ${url}`);
+      return "";
+    }
+
     const res = await fetch(url, {
       signal: AbortSignal.timeout(9000),
       headers: { "User-Agent": "Extensy-Sidekick-Researcher/1.0" },
@@ -312,10 +668,18 @@ Return ONLY one URL per line — no prose, no numbering, no markdown.`),
     : JSON.stringify(p2Response.content);
 
   const docUrls = urlBlock
-    .split("\n")
-    .map(l => l.trim())
-    .filter(l => l.startsWith("http"))
-    .slice(0, 8); // cap at 8 pages
+      .split("\n")
+      .map(l => l.trim())
+      .filter(l => l.startsWith("http"))
+      .filter((url) => {
+        try {
+          const parsed = new URL(url);
+          return parsed.protocol === "https:" && ALLOWED_DOC_HOSTS.has(parsed.hostname);
+        } catch {
+          return false;
+        }
+      })
+      .slice(0, 8); // cap at 8 pages
 
   console.log(`[researcher_node] Phase 2 ✓ — ${docUrls.length} URLs identified: ${docUrls.join(", ")}`);
 
@@ -415,7 +779,8 @@ Be specific. Include real endpoint paths, exact CSS classes, real permission nam
 async function coderNode(
   state: ExtensyState
 ): Promise<Partial<ExtensyState>> {
-  const isRetry = state.qa_logs.length > 0;
+  const isRetry = state.qa_logs.length > 0 || state.devtools_summary.length > 0;
+  const connectors = detectRequiredConnectors(state);
   console.log(
     `[coder_node] Generating code (retry=${isRetry}, attempt=${state.qa_retry_count + 1})…`
   );
@@ -439,6 +804,7 @@ Rules:
 - Never use eval() or inline scripts (CSP compliance)
 - Service workers must follow MV3 patterns (no persistent background pages)
 - All external requests must use host_permissions declared in the manifest
+- If auth, database, or payments are part of the product, wire the provided Extensy connector modules instead of inventing raw provider glue
 - Maintain pristine, highly readable code formatting with correct indentation and newlines in your stringified content. Never minify the code!
 - Output ONLY the JSON map — no markdown fences, no prose`;
 
@@ -459,13 +825,22 @@ Rules:
     );
   }
 
+  if (connectors.length > 0) {
+    parts.push(buildConnectorPrompt(connectors));
+  }
+
   if (isRetry) {
     const errorSummary = state.qa_logs
       .map((l) => `[${l.type}/${l.level}] ${l.message}`)
       .join("\n");
-    parts.push(
-      `## ⚠️ QA Errors — Fix These (attempt ${state.qa_retry_count + 1}/${MAX_QA_RETRIES})\n${errorSummary}`
-    );
+    
+    let retryContext = `## ⚠️ QA Errors — Fix These (attempt ${state.qa_retry_count + 1}/${MAX_QA_RETRIES})\n${errorSummary}`;
+    
+    if (state.devtools_summary) {
+      retryContext += `\n\n## 🔍 Deep Browser Diagnostics (DevTools MCP)\n${state.devtools_summary}`;
+    }
+    
+    parts.push(retryContext);
   }
 
   const userMessage = parts.join("\n\n");
@@ -525,8 +900,15 @@ Rules:
     `[coder_node] Generated ${Object.keys(sourceCode).length} file(s): ${Object.keys(sourceCode).join(", ")}`
   );
 
+  const connectorFiles = buildConnectorFiles(connectors);
+  const withConnectorFiles = {
+    ...sourceCode,
+    ...connectorFiles,
+  };
+  const patchedSourceCode = patchManifestForConnectors(withConnectorFiles, connectors);
+
   return {
-    source_code: sourceCode,
+    source_code: patchedSourceCode,
     // Reset qa_logs so only the *current* run's errors flow into the next retry.
     qa_logs: [],
     qa_retry_count: state.qa_retry_count + (isRetry ? 1 : 0),
@@ -665,6 +1047,11 @@ async function qaNode(
   // On Vercel (VERCEL=1) the local Playwright binary is absent; we use
   // @sparticuz/chromium which bundles a serverless-optimised Chromium build.
   const isVercel = process.env.VERCEL === "1";
+
+  let context;
+  const userDataDir = path.join(os.tmpdir(), "sidekick", "chromium-profile", crypto.randomUUID());
+  const debugPort = await getAvailablePort();
+  const popupUrl = resolveExtensionPopupUrl(state.source_code);
   const extensionArgs = [
     `--disable-extensions-except=${TMP_EXT_DIR}`,
     `--load-extension=${TMP_EXT_DIR}`,
@@ -672,27 +1059,25 @@ async function qaNode(
     "--disable-setuid-sandbox",
     "--disable-gpu",
     "--disable-dev-shm-usage",
+    `--remote-debugging-port=${debugPort}`,
   ];
 
-  let browser;
   try {
     if (isVercel) {
-      // Serverless path — sparticuz provides a pre-compiled Chromium binary.
       const executablePath = await sparticuzChromium.executablePath();
-      browser = await playwrightChromium.launch({
+      context = await playwrightChromium.launchPersistentContext(userDataDir, {
         headless: true,
         executablePath,
         args: [...sparticuzChromium.args, ...extensionArgs],
       });
     } else {
-      // Local dev path — Playwright manages its own Chromium download.
-      browser = await playwrightChromium.launch({
+      context = await playwrightChromium.launchPersistentContext(userDataDir, {
         headless: true,
         args: extensionArgs,
       });
     }
 
-    const context = await browser.newContext();
+    const extensionId = await resolveExtensionId(context);
     const page = await context.newPage();
 
     // ── Capture console messages ────────────────────────────────────────────
@@ -717,9 +1102,32 @@ async function qaNode(
       });
     });
 
-    await page.goto("about:blank");
-    await page.waitForTimeout(5000);
+    const targetUrl = popupUrl
+      ? `chrome-extension://${extensionId}/${popupUrl}`
+      : "about:blank";
+
+    await page.goto(targetUrl, { waitUntil: "load" });
+    await page.waitForTimeout(2000);
+
+    // ── DevTools MCP Diagnostics ────────────────────────────────────────────
+    console.log("[qa_node] 🔍 Running Chrome DevTools MCP diagnostics…");
+    const diagnostics = await runDevToolsDiagnostics(targetUrl, debugPort);
+    
+    if (diagnostics.consoleLogs.length > 0) logs.push(...diagnostics.consoleLogs);
+    if (diagnostics.networkErrors.length > 0) logs.push(...diagnostics.networkErrors);
+    if (diagnostics.domIssues.length > 0) logs.push(...diagnostics.domIssues);
+
+    // Store diagnostics in local variables to return after cleanup
+    const devtools_summary = diagnostics.rawSummary;
+
     await context.close();
+    await fs.rm(userDataDir, { recursive: true, force: true });
+
+    console.log(`[qa_node] QA complete. Captured ${logs.length} issue(s).`);
+    return { 
+      qa_logs: logs,
+      devtools_summary
+    };
   } catch (err) {
     console.error("[qa_node] Playwright launch failed:", err);
     logs.push({
@@ -729,13 +1137,56 @@ async function qaNode(
       captured_at: new Date().toISOString(),
     });
   } finally {
-    if (browser) {
-      await browser.close();
+    if (context) {
+      try { await context.close(); } catch {}
     }
+    await fs.rm(userDataDir, { recursive: true, force: true }).catch(() => {});
   }
 
-  console.log(`[qa_node] QA complete. Captured ${logs.length} issue(s).`);
   return { qa_logs: logs };
+}
+
+function resolveExtensionPopupUrl(sourceCode: SourceCode): string | null {
+  const manifestSource = sourceCode["manifest.json"];
+  if (!manifestSource) return null;
+
+  try {
+    const manifest = JSON.parse(manifestSource) as {
+      action?: { default_popup?: string };
+    };
+    return manifest.action?.default_popup?.replace(/^\/+/, "") ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function resolveExtensionId(
+  context: Awaited<ReturnType<typeof playwrightChromium.launchPersistentContext>>
+): Promise<string> {
+  const existingWorker = context.serviceWorkers()[0];
+  const serviceWorker =
+    existingWorker ?? await context.waitForEvent("serviceworker", { timeout: 15_000 });
+  return new URL(serviceWorker.url()).host;
+}
+
+async function getAvailablePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.unref();
+    server.on("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        server.close(() => reject(new Error("Failed to allocate a debug port")));
+        return;
+      }
+      const { port } = address;
+      server.close((err) => {
+        if (err) reject(err);
+        else resolve(port);
+      });
+    });
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -886,9 +1337,19 @@ async function integrationNode(
 ): Promise<Partial<ExtensyState>> {
   console.log("[integration_node] Auditing and wiring third-party integrations…");
 
+  const connectors = detectRequiredConnectors(state);
+  const connectorFiles = buildConnectorFiles(connectors);
   const llm = getCoderLLM("max"); // Sonnet for integration quality
 
-  const codeSnapshot = Object.entries(state.source_code)
+  const sourceCode = patchManifestForConnectors(
+    {
+      ...state.source_code,
+      ...connectorFiles,
+    },
+    connectors
+  );
+
+  const codeSnapshot = Object.entries(sourceCode)
     .map(([file, content]) => `// === ${file} ===\n${content}`)
     .join("\n\n");
 
@@ -896,13 +1357,14 @@ async function integrationNode(
 Review the provided source code.  If any third-party APIs are called:
 1. Generate thin, well-typed helper modules (e.g. api/client.js)
 2. Add any missing error-handling wrappers
-3. Return a JSON map of NEW OR MODIFIED files only (same schema as coder_node output)
+3. If auth/database/payments are required, wire the existing Extensy connector modules instead of inventing new provider clients
+4. Return a JSON map of NEW OR MODIFIED files only (same schema as coder_node output)
 If no integrations are needed, return an empty JSON object: {}`;
 
   const response = await llm.invoke([
     new SystemMessage(systemPrompt),
     new HumanMessage(
-      `Review and improve integrations in the following extension code:\n\n${codeSnapshot}`
+      `${buildConnectorPrompt(connectors)}\n\nReview and improve integrations in the following extension code:\n\n${codeSnapshot}`
     ),
   ]);
 
@@ -930,7 +1392,10 @@ If no integrations are needed, return an empty JSON object: {}`;
 
   // Merge integration files into existing source_code.
   return {
-    source_code: { ...state.source_code, ...integrationFiles },
+    source_code: patchManifestForConnectors(
+      { ...sourceCode, ...integrationFiles },
+      connectors
+    ),
   };
 }
 

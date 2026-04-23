@@ -37,6 +37,8 @@ export interface Blueprint {
   }>;
   /** Design profile the extension UI should follow (e.g., Apple Minimalist, Linear Dark, Stripe Vibrant) */
   design_profile?: string;
+  /** First-party Extensy connectors required by the project */
+  connectors?: Array<"supabase" | "stripe">;
   /** Raw requirements text preserved for downstream debugging */
   raw_requirements: string;
 }
@@ -133,6 +135,15 @@ export const StateAnnotation = Annotation.Root({
    * Used exclusively in Max-tier research_node runs.
    */
   research_context: Annotation<string>({
+    reducer: (_, next) => next,
+    default: () => "",
+  }),
+
+  /**
+   * Rich diagnostics from Chrome DevTools MCP.
+   * Captured during the qa_node execution.
+   */
+  devtools_summary: Annotation<string>({
     reducer: (_, next) => next,
     default: () => "",
   }),
