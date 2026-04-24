@@ -137,7 +137,7 @@ Sidekick dynamically routes graphs and chooses LLMs (`Haiku` vs `Sonnet`) based 
 | **UI Aesthetics** | ❌ | ✅ | ✅ |
 | **Playwright QA** | ❌ | ✅ | ✅ |
 | **Legal / TOS** | ❌ | ✅ | ✅ |
-| **Nia Search** | ❌ | ❌ | ✅ |
+| **Nia Search / Research Context** | ❌ | ✅ | ✅ |
 | **API Wiring** | ❌ | ❌ | ✅ |
 
 ---

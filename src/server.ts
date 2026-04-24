@@ -7,7 +7,9 @@
  * SSE event types emitted:
  *   phase    — { node: string, message: string }   current pipeline phase
  *   files    — Record<string, string>               final source file map
- *   legal    — { url: string }                      TOS URL (Pro only)
+ *   legal    — { url: string, terms_url?: string, privacy_url?: string }
+ *   promo    — structured promo-slide brief
+ *   publishing — structured Chrome Web Store metadata
  *   done     — { artifact_path: string }            pipeline complete
  *   error    — { message: string }                  unrecoverable error
  *
@@ -109,7 +111,7 @@ app.post("/generate", async (req: Request, res: Response) => {
     qa_node:           "Running QA tests in Chromium...",
     devtools_node:     "Performing deep DevTools diagnostics...",
     fan_out_router:    "Preparing final steps...",
-    legal_node:        "Generating Terms of Service...",
+    legal_node:        "Generating legal documents...",
     integration_node:  "Wiring third-party integrations...",
     assembler_node:    "Packaging your extension...",
   };
@@ -162,8 +164,20 @@ app.post("/generate", async (req: Request, res: Response) => {
     emit("files", finalState.source_code);
 
     // ── Emit legal URL if generated ─────────────────────────────────────────
-    if (finalState.legal_url) {
-      emit("legal", { url: finalState.legal_url });
+    if (finalState.legal_url || finalState.privacy_url) {
+      emit("legal", {
+        url: finalState.legal_url,
+        terms_url: finalState.legal_url,
+        privacy_url: finalState.privacy_url,
+      });
+    }
+
+    if (finalState.promo_brief) {
+      emit("promo", finalState.promo_brief);
+    }
+
+    if (finalState.publishing_brief) {
+      emit("publishing", finalState.publishing_brief);
     }
 
     // ── Emit done ───────────────────────────────────────────────────────────

@@ -58,6 +58,8 @@ import {
   type QALogEntry,
   type Blueprint,
   type SourceCode,
+  type PromoBrief,
+  type PublishingBrief,
 } from "./state";
 import {
   getArchitectLLM,
@@ -93,6 +95,7 @@ const ALLOWED_DOC_HOSTS = new Set([
   "docs.supabase.com",
 ]);
 type ConnectorKind = "supabase" | "stripe";
+type LegalDocKind = "terms-of-service" | "privacy-policy";
 
 // ---------------------------------------------------------------------------
 // Supabase client (used by legal_node to persist the TOS document)
@@ -170,6 +173,244 @@ function detectRequiredConnectors(state: ExtensyState): ConnectorKind[] {
   }
 
   return [...connectors];
+}
+
+function toKebabCase(input: string): string {
+  return input
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 120);
+}
+
+function escapeHtml(input: string): string {
+  return input
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function renderLegalDocumentHtml(params: {
+  title: string;
+  appName: string;
+  author: string;
+  body: string;
+}): string {
+  const paragraphs = params.body
+    .split(/\n{2,}/)
+    .map((chunk) => chunk.trim())
+    .filter(Boolean)
+    .map((chunk) => {
+      const lines = chunk.split("\n").map((line) => line.trim()).filter(Boolean);
+      if (lines.length === 1) {
+        return `<p>${escapeHtml(lines[0])}</p>`;
+      }
+      const [first, ...rest] = lines;
+      return `<section><h2>${escapeHtml(first)}</h2><p>${escapeHtml(rest.join(" "))}</p></section>`;
+    })
+    .join("\n");
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>${escapeHtml(params.title)} | ${escapeHtml(params.appName)}</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f5f1e8;
+      --panel: #fcfaf5;
+      --ink: #1f1914;
+      --muted: #6c6056;
+      --accent: #0f766e;
+      --line: rgba(31, 25, 20, 0.12);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Helvetica Neue", Arial, sans-serif;
+      background: var(--bg);
+      color: var(--ink);
+      line-height: 1.65;
+    }
+    main {
+      max-width: 860px;
+      margin: 0 auto;
+      padding: 48px 24px 80px;
+    }
+    header {
+      display: grid;
+      gap: 8px;
+      margin-bottom: 32px;
+      padding-bottom: 20px;
+      border-bottom: 1px solid var(--line);
+    }
+    .eyebrow {
+      font-size: 12px;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      color: var(--accent);
+    }
+    h1, h2 { margin: 0; line-height: 1.1; }
+    h1 { font-size: clamp(2.2rem, 6vw, 3.8rem); letter-spacing: -0.04em; }
+    h2 { font-size: 1.1rem; margin-bottom: 12px; letter-spacing: -0.02em; }
+    p { margin: 0 0 16px; color: var(--ink); }
+    section { margin-bottom: 24px; }
+    .meta { color: var(--muted); font-size: 0.95rem; }
+    .shell {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      padding: 28px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div class="eyebrow">${escapeHtml(params.appName)}</div>
+      <h1>${escapeHtml(params.title)}</h1>
+      <div class="meta">Publisher: ${escapeHtml(params.author)}</div>
+    </header>
+    <div class="shell">
+      ${paragraphs}
+    </div>
+  </main>
+</body>
+</html>`;
+}
+
+async function uploadLegalDocument(params: {
+  supabase: ReturnType<typeof getSupabaseClient>;
+  author: string;
+  docId: string;
+  kind: LegalDocKind;
+  content: string;
+  contentType: string;
+}): Promise<string> {
+  const fileName = `legal/${params.author}/${params.kind}/${params.docId}.html`;
+  const { error } = await params.supabase.storage
+    .from("legal-docs")
+    .upload(fileName, Buffer.from(params.content, "utf-8"), {
+      contentType: params.contentType,
+      upsert: true,
+    });
+
+  if (error) throw error;
+
+  const { data } = params.supabase.storage.from("legal-docs").getPublicUrl(fileName);
+  if (!data?.publicUrl) {
+    throw new Error(`[legal_node] Missing public URL for ${fileName}`);
+  }
+
+  return data.publicUrl;
+}
+
+function getDesignDirection(profile?: string): string {
+  const normalized = (profile || "").toLowerCase();
+  if (normalized.includes("editorial")) return "Editorial Utility";
+  return "Editorial Utility";
+}
+
+function buildPromoBrief(state: ExtensyState): PromoBrief {
+  const blueprint = state.blueprint;
+  const extensionName = blueprint?.name ?? "This Extension";
+  const description = blueprint?.description ?? state.user_prompt;
+  const tagline = description.length > 110 ? `${description.slice(0, 107)}...` : description;
+  const features = (blueprint?.features ?? [])
+    .map((feature) => feature.summary.trim())
+    .filter(Boolean)
+    .slice(0, 5);
+  const permissions = blueprint?.permissions ?? [];
+  const audience = /developer|github|api|debug/i.test(description)
+    ? "Developers and technical operators who need focused browser workflows."
+    : "Knowledge workers who want a cleaner, faster browser workflow.";
+
+  return {
+    design_direction: getDesignDirection(blueprint?.design_profile),
+    palette: ["#f5f1e8", "#fcfaf5", "#1f1914", "#0f766e"],
+    tagline,
+    audience,
+    slides: [
+      {
+        title: extensionName,
+        body: tagline,
+        visual_focus: "Editorial hero with asymmetrical composition, mono metadata, and the primary task front and center.",
+      },
+      {
+        title: "What It Solves",
+        body: features[0] ?? "Focus the browser workflow around a single high-value task.",
+        visual_focus: "Clean product framing with one dominant workflow panel and restrained annotation callouts.",
+      },
+      {
+        title: "Core Workflow",
+        body: features[1] ?? features[0] ?? "Show the main loop the user repeats every day inside the extension.",
+        visual_focus: "Step-based editorial layout showing input, processing state, and result.",
+      },
+      {
+        title: "Built For Real Use",
+        body: features[2] ?? `Permissions and integrations are tailored to ${extensionName}, not stock boilerplate.`,
+        visual_focus: `Precision detail slide highlighting ${permissions.slice(0, 3).join(", ") || "extension capabilities"} with utility-style labels.`,
+      },
+      {
+        title: "Why It Feels Better",
+        body: features[3] ?? features[4] ?? "The UI is designed as an editorial utility: calm, focused, and specific to the job.",
+        visual_focus: "Refined closing slide with quiet typography, focused controls, and no generic marketing clutter.",
+      },
+    ],
+  };
+}
+
+function buildPublishingBrief(state: ExtensyState): PublishingBrief {
+  const blueprint = state.blueprint;
+  const extensionName = blueprint?.name ?? "This Extension";
+  const shortDescriptionBase = blueprint?.description ?? state.user_prompt;
+  const shortDescription = shortDescriptionBase.length > 132
+    ? `${shortDescriptionBase.slice(0, 129)}...`
+    : shortDescriptionBase;
+  const featureLines = (blueprint?.features ?? [])
+    .map((feature) => `- ${feature.summary}`)
+    .slice(0, 6);
+  const permissions = blueprint?.permissions ?? [];
+  const hostPermissions = blueprint?.host_permissions ?? [];
+  const privacyPractices = [
+    permissions.includes("storage")
+      ? "Stores extension settings and user workflow state locally in Chrome extension storage."
+      : "Does not rely on persistent local storage beyond what Chrome requires for runtime behavior.",
+    detectRequiredConnectors(state).includes("supabase")
+      ? "Uses Supabase-backed authentication or data sync only when the product requires signed-in workflows."
+      : "Does not require backend account storage unless explicitly requested by the product flow.",
+    hostPermissions.length > 0
+      ? `Makes external requests only to declared host permissions: ${hostPermissions.join(", ")}.`
+      : "Does not call undeclared third-party hosts.",
+  ];
+
+  return {
+    listing_title: extensionName,
+    short_description: shortDescription,
+    detailed_description: [
+      shortDescriptionBase,
+      "",
+      ...featureLines,
+    ].join("\n"),
+    category_hint: /developer|github|api|debug/i.test(shortDescriptionBase) ? "Developer Tools" : "Productivity",
+    permissions,
+    host_permissions: hostPermissions,
+    legal_urls: {
+      terms_of_service: state.legal_url,
+      privacy_policy: state.privacy_url,
+    },
+    privacy_practices_summary: privacyPractices,
+    upload_readiness_checks: [
+      "Confirm the extension ZIP loads cleanly without QA errors.",
+      "Confirm the Terms of Service URL is publicly reachable without authentication.",
+      "Confirm the Privacy Policy URL is publicly reachable without authentication.",
+      "Provide screenshots and promo slides that match the generated extension UI, not generic marketing art.",
+      "Review requested permissions against the listed product behavior before submission.",
+    ],
+  };
 }
 
 function buildConnectorFiles(connectors: ConnectorKind[]): SourceCode {
@@ -514,7 +755,7 @@ Given a user prompt, produce a STRICT JSON object that conforms to this schema:
   "permissions": string[],
   "host_permissions": string[],
   "features": [{ "id": string, "summary": string, "implementation_hint": string }],
-  "design_profile": string, // e.g. "Apple Minimalist", "Linear Dark Mode", or "Stripe Vibrant" (auto-select best fit based on extension type)
+  "design_profile": string, // prefer "Editorial Utility" unless the product explicitly demands another visual direction
   "connectors": ["supabase" | "stripe"], // include only if auth, database, or payments are required
   "raw_requirements": string
 }
@@ -627,14 +868,13 @@ async function researcherNode(
   console.log(`[researcher_node] Starting deep research (tier=${state.subscription_tier})…`);
 
   const decomposerLLM  = getDecomposerLLM();   // claude-haiku-4-5 — fast & cheap
-  const researcherLLM  = getResearcherLLM();    // claude-sonnet-4-5 + NIA_API_KEY
   const synthesizerLLM = getArchitectLLM();     // claude-sonnet-4-5 for synthesis
 
   const blueprintJson = state.blueprint
     ? JSON.stringify(state.blueprint, null, 2)
     : `User prompt: ${state.user_prompt}`;
 
-  const designProfile = state.blueprint?.design_profile || "Premium Dark Mode";
+  const designProfile = state.blueprint?.design_profile || "Editorial Utility";
 
   // ── Phase 1: Decompose → Research Questions ─────────────────────────────
   console.log("[researcher_node] Phase 1 — Decomposing into research questions…");
@@ -700,25 +940,31 @@ Return ONLY one URL per line — no prose, no numbering, no markdown.`),
   // ── Phase 4: Nia Semantic Recall ─────────────────────────────────────────
   console.log("[researcher_node] Phase 4 — Pulling context from Nia…");
 
-  const p4Response = await researcherLLM.invoke([
-    new SystemMessage(`You are a Nia context retrieval agent.
+  let niaContext = "(Nia unavailable for this run)";
+  try {
+    const researcherLLM = getResearcherLLM(); // claude-sonnet-4-5 + NIA_API_KEY
+    const p4Response = await researcherLLM.invoke([
+      new SystemMessage(`You are a Nia context retrieval agent.
 Using your Nia knowledge base, surface ONLY what is directly relevant to the request.
 Do not invent or generalize. Return exact design tokens, code patterns, and API snippets found in Nia.
 Return plain text grouped by clear section headers.`),
-    new HumanMessage(
-      `Retrieve from Nia:\n` +
-      `1. "Chrome Extension Manifest V3 best practices and API patterns"\n` +
-      `2. "${designProfile} design profile: exact Tailwind tokens, padding scale, colors, border radius"\n` +
-      `3. "Google Font imports, inline SVG usage, and micro-interaction CSS for premium extensions"\n\n` +
-      `Blueprint context:\n${blueprintJson}`
-    ),
-  ]);
+      new HumanMessage(
+        `Retrieve from Nia:\n` +
+        `1. "Chrome Extension Manifest V3 best practices and API patterns"\n` +
+        `2. "${designProfile} design profile: exact Tailwind tokens, padding scale, colors, border radius"\n` +
+        `3. "Google Font imports, inline SVG usage, and micro-interaction CSS for premium extensions"\n\n` +
+        `Blueprint context:\n${blueprintJson}`
+      ),
+    ]);
 
-  const niaContext = typeof p4Response.content === "string"
-    ? p4Response.content
-    : JSON.stringify(p4Response.content);
+    niaContext = typeof p4Response.content === "string"
+      ? p4Response.content
+      : JSON.stringify(p4Response.content);
 
-  console.log(`[researcher_node] Phase 4 ✓ — Nia returned ${niaContext.length} chars`);
+    console.log(`[researcher_node] Phase 4 ✓ — Nia returned ${niaContext.length} chars`);
+  } catch (err) {
+    console.warn(`[researcher_node] Phase 4 skipped — Nia unavailable: ${String(err)}`);
+  }
 
   // ── Phase 5: Synthesize (Max-tier only) ──────────────────────────────────
   if (state.subscription_tier !== "max") {
@@ -941,11 +1187,12 @@ async function uiDesignerNode(
 Your task is to completely eliminate generic 'vibecoded' UI and apply a highly structured, premium aesthetic based on the provided design profile and research context.
 
 Strict Design Rules:
-1. DESIGN PROFILE: You must strictly apply the "${state.blueprint?.design_profile || 'Premium Minimalist'}" design profile.
+1. DESIGN PROFILE: You must strictly apply the "${state.blueprint?.design_profile || 'Editorial Utility'}" design profile.
 2. RESEARCH CONTEXT: Use the exact color codes, Tailwind padding tokens, and border radii provided in the Nia Design Inspiration context below. Do not guess arbitrary values.
-3. FOUNDATION: Always inject a modern Google Font (e.g. Inter, Outfit, Plus Jakarta Sans). Use high-quality inline SVGs configured with \`currentColor\`—do NOT use emojis for icons.
-4. MICRO-INTERACTIONS: Every interactive element must feel alive but controlled. Use exact transitions: \`transition-all duration-200 hover:scale-[1.02] active:scale-[0.98]\` for buttons. Use \`hover:bg-white/5 hover:border-white/10\` for cards. Use clear focus rings (\`focus:ring-2 focus:outline-none\`).
-5. SPACING: Use a strict 4-point spacing scale. Avoid random padding like \`p-3\` and \`p-5\`. Standardize containers to \`p-4\` and gaps to \`gap-4\`.
+3. EDITORIAL UTILITY DIRECTION: Use a warm off-white canvas, deep ink text, one restrained accent, left-aligned hierarchy, mono metadata labels, and asymmetrical composition. Avoid SaaS dashboard tropes, glow effects, centered hero blocks, purple/blue AI gradients, and card spam.
+4. FOUNDATION: Prefer a distinctive editorial sans such as Outfit, Manrope, or Plus Jakarta Sans paired with a mono for labels. Use high-quality inline SVGs configured with \`currentColor\`—do NOT use emojis for icons.
+5. MICRO-INTERACTIONS: Keep motion minimal and tactile. Use \`transition-all duration-200 ease-out active:scale-[0.98]\` for buttons and restrained hover shifts instead of loud animation.
+6. SPACING: Use a strict 4-point spacing scale. Favor \`p-4\`, \`p-6\`, \`gap-3\`, \`gap-4\`, and strong whitespace rhythm. Not every section should be boxed.
 
 Return ONLY a JSON object where each key is a relative file path (same as provided) and each value is the strictly formatted stringified file content.
 Example: { "popup.html": "...", "popup.css": "..." }
@@ -1261,67 +1508,101 @@ function fanOutRouterFn(state: ExtensyState): string[] | string {
 // ---------------------------------------------------------------------------
 
 /**
- * Generates a Terms of Service document tailored to the extension,
- * uploads it to Supabase Storage, and returns the public URL.
+ * Generates Terms of Service + Privacy Policy documents tailored to the extension,
+ * uploads them to Supabase Storage, and returns public URLs.
  */
 async function legalNode(
   state: ExtensyState
 ): Promise<Partial<ExtensyState>> {
-  console.log("[legal_node] Generating Terms of Service…");
+  console.log("[legal_node] Generating legal documents…");
 
   const llm = getLegalLLM(); // Haiku — cost-efficient for doc generation
 
   const blueprint = state.blueprint;
   const extensionName = blueprint?.name ?? "This Extension";
+  let cleanAuthor = toKebabCase(state.author);
+  if (!cleanAuthor) cleanAuthor = "user";
+  const docId = state.tos_id || crypto.randomUUID();
 
-  const systemPrompt = `You are a legal document specialist.
+  const tosPrompt = `You are a legal document specialist.
 Generate a concise but complete Terms of Service for a Chrome Extension.
 Include: acceptance clause, data handling, limitation of liability, GDPR notice (if applicable), and contact information placeholder.
 Use plain English. Return plain text only (no markdown).`;
 
-  const response = await llm.invoke([
-    new SystemMessage(systemPrompt),
+  const privacyPrompt = `You are a legal document specialist.
+Generate a concise but complete Privacy Policy for a Chrome Extension.
+Include: what data is collected, how it is used, storage/retention, third-party processors, user rights, and contact information placeholder.
+Use plain English. Return plain text only (no markdown).`;
+
+  const tosResponse = await llm.invoke([
+    new SystemMessage(tosPrompt),
     new HumanMessage(
       `Extension name: ${extensionName}\nDescription: ${blueprint?.description ?? state.user_prompt}`
     ),
   ]);
 
-  const tosContent =
-    typeof response.content === "string"
-      ? response.content
-      : JSON.stringify(response.content);
+  const privacyResponse = await llm.invoke([
+    new SystemMessage(privacyPrompt),
+    new HumanMessage(
+      `Extension name: ${extensionName}\nDescription: ${blueprint?.description ?? state.user_prompt}\nPermissions: ${(blueprint?.permissions ?? []).join(", ")}\nHosts: ${(blueprint?.host_permissions ?? []).join(", ")}`
+    ),
+  ]);
 
-  // ── Upload TOS to Supabase Storage ───────────────────────────────────────
+  const tosContent =
+    typeof tosResponse.content === "string"
+      ? tosResponse.content
+      : JSON.stringify(tosResponse.content);
+  const privacyContent =
+    typeof privacyResponse.content === "string"
+      ? privacyResponse.content
+      : JSON.stringify(privacyResponse.content);
+
+  // ── Upload legal docs to Supabase Storage ────────────────────────────────
   let legalUrl = "";
-  let cleanAuthor = state.author.toLowerCase().replace(/[^a-z0-9]/g, '-');
-  if (!cleanAuthor || cleanAuthor.length === 0) cleanAuthor = "user";
-  const tosId = state.tos_id || crypto.randomUUID();
+  let privacyUrl = "";
+  const termsHtml = renderLegalDocumentHtml({
+    title: "Terms of Service",
+    appName: extensionName,
+    author: cleanAuthor,
+    body: tosContent,
+  });
+  const privacyHtml = renderLegalDocumentHtml({
+    title: "Privacy Policy",
+    appName: extensionName,
+    author: cleanAuthor,
+    body: privacyContent,
+  });
 
   try {
     const supabase = getSupabaseClient();
-    const fileName = `tos/${cleanAuthor}/${tosId}.txt`;
-
-    const { error } = await supabase.storage
-      .from("legal-docs")
-      .upload(fileName, Buffer.from(tosContent, "utf-8"), {
-        contentType: "text/plain",
-        upsert: true,
-      });
-
-    if (error) {
-      console.error("[legal_node] Supabase upload error:", error.message);
-      legalUrl = `data:text/plain;base64,${Buffer.from(tosContent).toString("base64")}`;
-    } else {
-      // Return a clean vanity URL hosted by Extensy Next.js app
-      legalUrl = `https://app.extensy.dev/${cleanAuthor}/terms-of-service/${tosId}`;
-    }
+    legalUrl = await uploadLegalDocument({
+      supabase,
+      author: cleanAuthor,
+      docId,
+      kind: "terms-of-service",
+      content: termsHtml,
+      contentType: "text/html",
+    });
+    privacyUrl = await uploadLegalDocument({
+      supabase,
+      author: cleanAuthor,
+      docId,
+      kind: "privacy-policy",
+      content: privacyHtml,
+      contentType: "text/html",
+    });
   } catch (err) {
     console.error("[legal_node] Unexpected Supabase error:", err);
-    legalUrl = `data:text/plain;base64,${Buffer.from(tosContent).toString("base64")}`;
+    legalUrl = `data:text/html;base64,${Buffer.from(termsHtml).toString("base64")}`;
+    privacyUrl = `data:text/html;base64,${Buffer.from(privacyHtml).toString("base64")}`;
   }
 
-  console.log(`[legal_node] TOS URL: ${legalUrl}`);
-  return { legal_url: legalUrl };
+  console.log(`[legal_node] Terms URL: ${legalUrl}`);
+  console.log(`[legal_node] Privacy URL: ${privacyUrl}`);
+  return {
+    legal_url: legalUrl,
+    privacy_url: privacyUrl,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1405,7 +1686,7 @@ If no integrations are needed, return an empty JSON object: {}`;
 
 /**
  * Collects all source files and zips them into a distributable archive.
- * Also injects the TOS URL into manifest.json if present (Pro/Max).
+ * Also injects publishing metadata and legal URLs for downstream Extensy flows.
  */
 async function assemblerNode(
   state: ExtensyState
@@ -1413,17 +1694,28 @@ async function assemblerNode(
   console.log("[assembler_node] Assembling final Chrome Extension ZIP…");
 
   const zip = new JSZip();
-  const sourceCode = state.source_code;
+  const promoBrief = buildPromoBrief(state);
+  const publishingBrief = buildPublishingBrief(state);
+  const sourceCode: SourceCode = {
+    ...state.source_code,
+    "EXTENSY_PROMO_BRIEF.json": JSON.stringify(promoBrief, null, 2),
+    "EXTENSY_CHROME_WEB_STORE.json": JSON.stringify(publishingBrief, null, 2),
+  };
 
   for (const [filePath, content] of Object.entries(sourceCode)) {
     zip.file(filePath, content);
   }
 
-  // Inject TOS URL into the extension as a README if available.
-  if (state.legal_url) {
+  // Inject legal URLs into the build output for publishing workflows.
+  if (state.legal_url || state.privacy_url) {
     zip.file(
       "LEGAL.txt",
-      `Terms of Service: ${state.legal_url}\n\nThis extension was generated by Extensy (https://extensy.app).`
+      [
+        `Terms of Service: ${state.legal_url || "N/A"}`,
+        `Privacy Policy: ${state.privacy_url || "N/A"}`,
+        "",
+        "This extension was generated by Extensy (https://extensy.app).",
+      ].join("\n")
     );
   }
 
@@ -1452,7 +1744,12 @@ async function assemblerNode(
     console.log(`[assembler_node] ✅ Extension ready (Vercel — in-memory only): ${extensionName}`);
   }
 
-  return { artifact_path: artifactPath };
+  return {
+    artifact_path: artifactPath,
+    source_code: sourceCode,
+    promo_brief: promoBrief,
+    publishing_brief: publishingBrief,
+  };
 }
 
 // ---------------------------------------------------------------------------

@@ -63,6 +63,35 @@ export interface QALogEntry {
   captured_at: string;
 }
 
+export interface PromoSlide {
+  title: string;
+  body: string;
+  visual_focus: string;
+}
+
+export interface PromoBrief {
+  design_direction: string;
+  palette: string[];
+  tagline: string;
+  audience: string;
+  slides: PromoSlide[];
+}
+
+export interface PublishingBrief {
+  listing_title: string;
+  short_description: string;
+  detailed_description: string;
+  category_hint: string;
+  permissions: string[];
+  host_permissions: string[];
+  legal_urls: {
+    terms_of_service: string;
+    privacy_policy: string;
+  };
+  privacy_practices_summary: string[];
+  upload_readiness_checks: string[];
+}
+
 /**
  * SubscriptionTier — enforced at the initial router.
  * Free  → minimal model, no planning, no legal, basic assembler
@@ -131,8 +160,8 @@ export const StateAnnotation = Annotation.Root({
   }),
 
   /**
-   * Ground-truth documentation fetched from the Nia context API.
-   * Used exclusively in Max-tier research_node runs.
+   * Research brief merged from fetched web docs and Nia context when available.
+   * Populated by the researcher_node for Pro and Max tiers.
    */
   research_context: Annotation<string>({
     reducer: (_, next) => next,
@@ -155,6 +184,24 @@ export const StateAnnotation = Annotation.Root({
   source_code: Annotation<SourceCode>({
     reducer: (_, next) => next,
     default: () => ({}),
+  }),
+
+  /** Public Privacy Policy URL generated alongside the Terms URL. */
+  privacy_url: Annotation<string>({
+    reducer: (_, next) => next,
+    default: () => "",
+  }),
+
+  /** Structured promo-slide input for the Extensy promo renderer. */
+  promo_brief: Annotation<PromoBrief | null>({
+    reducer: (_, next) => next,
+    default: () => null,
+  }),
+
+  /** Structured Chrome Web Store publishing metadata for the frontend. */
+  publishing_brief: Annotation<PublishingBrief | null>({
+    reducer: (_, next) => next,
+    default: () => null,
   }),
 
   /**
