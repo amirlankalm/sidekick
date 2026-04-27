@@ -153,6 +153,7 @@ npx playwright install chromium
 ```
 
 > **Note on Secrets**: Keep `.env.local` uncommitted. Sidekick uses reference variables internally.
+> **Tip**: Run these commands from the repository root so Playwright and TypeScript resolve the local project files correctly.
 
 ### 2. Running the Engine
 You can run the full pipeline locally. The engine is written in TypeScript and executed via `ts-node`:
