@@ -113,6 +113,17 @@ export type SubscriptionTier = "free" | "pro" | "max";
  *  - Array fields (qa_logs) use an append reducer so no log is lost.
  */
 export const StateAnnotation = Annotation.Root({
+  // ── Correlation ───────────────────────────────────────────────────────────
+
+  /**
+   * Unique ID for this pipeline run — generated in server.ts and threaded
+   * through every node for log correlation and audit trails.
+   */
+  requestId: Annotation<string>({
+    reducer: (_, next) => next,
+    default: () => "",
+  }),
+
   // ── Input ─────────────────────────────────────────────────────────────────
 
   /** The raw natural-language prompt from the user */

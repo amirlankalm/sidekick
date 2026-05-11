@@ -2,72 +2,203 @@
  * server.ts — Sidekick HTTP API Server
  *
  * Wraps buildGraph() behind a POST /generate endpoint that streams
- * Server-Sent Events (SSE) back to the caller (Extensy or any client).
+ * Server-Sent Events (SSE) back to Extensy's frontend.
+ *
+ * Security layers:
+ *   1. CORS allowlist — only Extensy origins can make cross-origin requests
+ *   2. Rate limiting  — 60 req/min global; 5 req/min on /generate per IP
+ *   3. Auth           — Supabase JWT verification via Authorization header
+ *                       (REQUIRE_AUTH=true enforces it; false = warn only)
+ *   4. Input validation — prompt required, tier enum-checked, fields clamped
+ *   5. Request ID      — every request gets a UUID for full log correlation
  *
  * SSE event types emitted:
- *   phase    — { node: string, message: string }   current pipeline phase
- *   files    — Record<string, string>               final source file map
- *   legal    — { url: string, terms_url?: string, privacy_url?: string }
- *   promo    — structured promo-slide brief
- *   publishing — structured Chrome Web Store metadata
- *   done     — { artifact_path: string }            pipeline complete
- *   error    — { message: string }                  unrecoverable error
- *
- * Works both locally (ts-node src/server.ts) and on Vercel
- * (exported as the default handler via serverless-http).
+ *   phase      — { node: string, message: string }
+ *   files      — Record<string, string>
+ *   legal      — { url: string, terms_url?: string, privacy_url?: string }
+ *   promo      — PromoBrief
+ *   publishing — PublishingBrief
+ *   done       — { artifact_path: string, qa_retries: number }
+ *   error      — { message: string }
  */
 
 import "dotenv/config";
+import { randomUUID } from "crypto";
 import express, { Request, Response } from "express";
+import rateLimit from "express-rate-limit";
+import { createClient } from "@supabase/supabase-js";
 import { buildGraph } from "./graph";
+import { logger } from "./logger";
 import type { ExtensyState } from "./state";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-const ALLOWED_ORIGIN_SUFFIXES = [".extensy.app", ".vercel.app"];
+// ---------------------------------------------------------------------------
+// CORS
+// ---------------------------------------------------------------------------
+
+const ALLOWED_ORIGINS = new Set([
+  "https://extensy.app",
+  "https://www.extensy.app",
+  "https://extensy.dev",
+  "https://www.extensy.dev",
+  "https://sidekick.extensy.dev",
+  "http://localhost:3000",
+  "http://localhost:3001",
+]);
+const ALLOWED_ORIGIN_SUFFIXES = [".extensy.app", ".extensy.dev", ".vercel.app"];
 
 function isAllowedOrigin(origin: string): boolean {
   if (!origin) return false;
-
   try {
     const parsed = new URL(origin);
-    if (process.env.NODE_ENV !== "production") {
-      return true;
-    }
-
-    if (["http://localhost:3000", "http://localhost:3001", "https://extensy.app"].includes(origin)) {
-      return true;
-    }
-
+    if (process.env.NODE_ENV !== "production") return true;
+    if (ALLOWED_ORIGINS.has(origin)) return true;
     return ALLOWED_ORIGIN_SUFFIXES.some((suffix) => parsed.hostname.endsWith(suffix));
   } catch {
     return false;
   }
 }
 
-// ── CORS: allow Extensy frontend and sidekick.extensy.dev ─────────────────
 app.use((req, res, next) => {
   const origin = req.headers.origin ?? "";
-
   if (isAllowedOrigin(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
   }
   res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Request-Id");
   res.setHeader("Access-Control-Allow-Credentials", "true");
+  res.setHeader("Access-Control-Expose-Headers", "X-Request-Id");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
 
-// ── Health check ──────────────────────────────────────────────────────────
-app.get("/health", (_req, res) => {
+// ---------------------------------------------------------------------------
+// Rate limiting
+// ---------------------------------------------------------------------------
+
+/** Global limit — protects all endpoints from general abuse */
+const globalLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 60,
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+  message: { error: "Too many requests — slow down" },
+  handler(req, res, next, options) {
+    logger.warn("Global rate limit exceeded", { ip: req.ip, path: req.path });
+    res.status(options.statusCode).json(options.message);
+  },
+});
+
+/** Generate-specific limit — heavy LLM + Playwright endpoint */
+const generateLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 5,
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+  message: { error: "Too many generation requests — please wait before trying again" },
+  handler(req, res, next, options) {
+    logger.warn("/generate rate limit exceeded", { ip: req.ip });
+    res.status(options.statusCode).json(options.message);
+  },
+});
+
+app.use(globalLimiter);
+
+// ---------------------------------------------------------------------------
+// Auth — Supabase JWT verification
+// ---------------------------------------------------------------------------
+
+const REQUIRE_AUTH = process.env.REQUIRE_AUTH === "true";
+
+interface AuthResult {
+  userId: string | null;
+  authenticated: boolean;
+}
+
+async function verifySupabaseToken(token: string): Promise<AuthResult> {
+  const url  = process.env.SUPABASE_URL;
+  const key  = process.env.SUPABASE_ANON_KEY;
+  if (!url || !key) return { userId: null, authenticated: false };
+
+  try {
+    const supabase = createClient(url, key);
+    const { data, error } = await supabase.auth.getUser(token);
+    if (error || !data.user) return { userId: null, authenticated: false };
+    return { userId: data.user.id, authenticated: true };
+  } catch {
+    return { userId: null, authenticated: false };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Health endpoints
+// ---------------------------------------------------------------------------
+
+app.get("/", (_req, res) => {
   res.json({ status: "ok", service: "sidekick-engine" });
 });
 
-// ── POST /generate — main pipeline endpoint ───────────────────────────────
-app.post("/generate", async (req: Request, res: Response) => {
+app.get("/health", (_req, res) => {
+  res.json({
+    status: "ok",
+    service: "sidekick-engine",
+    uptime_seconds: Math.round(process.uptime()),
+  });
+});
+
+// ---------------------------------------------------------------------------
+// POST /generate — main pipeline endpoint
+// ---------------------------------------------------------------------------
+
+const VALID_TIERS = new Set(["free", "pro", "max"]);
+
+const PHASE_MESSAGES: Record<string, string> = {
+  architect_node:   "Analyzing your prompt...",
+  researcher_node:  "Fetching Chrome Extension docs...",
+  coder_node:       "Writing extension code...",
+  ui_designer_node: "Polishing popup UI...",
+  qa_node:          "Running QA tests in Chromium...",
+  devtools_node:    "Performing deep DevTools diagnostics...",
+  fan_out_router:   "Preparing final steps...",
+  legal_node:       "Generating legal documents...",
+  integration_node: "Wiring third-party integrations...",
+  assembler_node:   "Packaging your extension...",
+};
+
+app.post("/generate", generateLimiter, async (req: Request, res: Response) => {
+  const requestId = randomUUID();
+  const log = logger.child({ requestId });
+
+  // ── Auth ─────────────────────────────────────────────────────────────────
+  const authHeader = req.headers.authorization ?? "";
+  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+
+  let userId: string | null = null;
+
+  if (token) {
+    const auth = await verifySupabaseToken(token);
+    if (!auth.authenticated) {
+      log.warn("Invalid Supabase token provided");
+      if (REQUIRE_AUTH) {
+        res.status(401).json({ error: "Invalid or expired authentication token" });
+        return;
+      }
+    } else {
+      userId = auth.userId;
+      log.info("Request authenticated", { userId });
+    }
+  } else {
+    log.warn("Unauthenticated /generate request", { ip: req.ip });
+    if (REQUIRE_AUTH) {
+      res.status(401).json({ error: "Authorization header with Bearer token is required" });
+      return;
+    }
+  }
+
+  // ── Input validation ──────────────────────────────────────────────────────
   const {
     prompt,
     subscription_tier = "free",
@@ -76,7 +207,7 @@ app.post("/generate", async (req: Request, res: Response) => {
     tos_id = "",
   } = req.body as {
     prompt?: string;
-    subscription_tier?: "free" | "pro" | "max";
+    subscription_tier?: string;
     planning_mode?: boolean;
     author?: string;
     tos_id?: string;
@@ -87,43 +218,38 @@ app.post("/generate", async (req: Request, res: Response) => {
     return;
   }
 
-  if (!["free", "pro", "max"].includes(subscription_tier)) {
+  if (!VALID_TIERS.has(subscription_tier)) {
     res.status(400).json({ error: "subscription_tier must be free, pro, or max" });
     return;
   }
 
-  // ── Set up SSE headers ────────────────────────────────────────────────────
+  const safeTier = subscription_tier as "free" | "pro" | "max";
+
+  log.info("/generate request received", {
+    userId,
+    tier: safeTier,
+    promptLength: prompt.trim().length,
+  });
+
+  // ── SSE setup ─────────────────────────────────────────────────────────────
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Request-Id", requestId);
   res.flushHeaders();
 
-  /** Sends one SSE frame to the client */
   const emit = (event: string, data: unknown) => {
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-  };
-
-  // Map LangGraph node names → human-readable phase messages for the UI
-  const PHASE_MESSAGES: Record<string, string> = {
-    architect_node:    "Analyzing your prompt...",
-    researcher_node:   "Fetching Chrome Extension docs...",
-    coder_node:        "Writing extension code...",
-    qa_node:           "Running QA tests in Chromium...",
-    devtools_node:     "Performing deep DevTools diagnostics...",
-    fan_out_router:    "Preparing final steps...",
-    legal_node:        "Generating legal documents...",
-    integration_node:  "Wiring third-party integrations...",
-    assembler_node:    "Packaging your extension...",
   };
 
   try {
     const graph = buildGraph();
 
-    // Stream node-level events by subscribing to graph events
     const stream = graph.streamEvents(
       {
+        requestId,
         user_prompt: prompt.trim(),
-        subscription_tier,
+        subscription_tier: safeTier,
         planning_mode,
         author: author.trim().slice(0, 120),
         tos_id: tos_id.trim().slice(0, 120),
@@ -134,7 +260,6 @@ app.post("/generate", async (req: Request, res: Response) => {
     let finalState: ExtensyState | null = null;
 
     for await (const event of stream) {
-      // ── Emit phase updates per node entry ──────────────────────────────
       if (event.event === "on_chain_start" && event.name in PHASE_MESSAGES) {
         emit("phase", {
           node: event.name,
@@ -142,7 +267,6 @@ app.post("/generate", async (req: Request, res: Response) => {
         });
       }
 
-      // ── Capture final state when graph completes ────────────────────────
       if (event.event === "on_chain_end" && event.name === "LangGraph") {
         finalState = event.data?.output as ExtensyState;
       }
@@ -155,15 +279,14 @@ app.post("/generate", async (req: Request, res: Response) => {
     }
 
     if (finalState.error) {
+      log.error("Pipeline completed with error", { error: finalState.error });
       emit("error", { message: finalState.error });
       res.end();
       return;
     }
 
-    // ── Emit generated files ────────────────────────────────────────────────
     emit("files", finalState.source_code);
 
-    // ── Emit legal URL if generated ─────────────────────────────────────────
     if (finalState.legal_url || finalState.privacy_url) {
       emit("legal", {
         url: finalState.legal_url,
@@ -172,22 +295,22 @@ app.post("/generate", async (req: Request, res: Response) => {
       });
     }
 
-    if (finalState.promo_brief) {
-      emit("promo", finalState.promo_brief);
-    }
+    if (finalState.promo_brief) emit("promo", finalState.promo_brief);
+    if (finalState.publishing_brief) emit("publishing", finalState.publishing_brief);
 
-    if (finalState.publishing_brief) {
-      emit("publishing", finalState.publishing_brief);
-    }
-
-    // ── Emit done ───────────────────────────────────────────────────────────
     emit("done", {
       artifact_path: finalState.artifact_path,
       qa_retries: finalState.qa_retry_count,
     });
 
+    log.info("/generate completed", {
+      userId,
+      tier: safeTier,
+      qaRetries: finalState.qa_retry_count,
+      fileCount: Object.keys(finalState.source_code).length,
+    });
   } catch (err) {
-    console.error("[server] Unhandled pipeline error:", err);
+    log.error("Unhandled pipeline error", { error: String(err) });
     emit("error", {
       message: err instanceof Error ? err.message : String(err),
     });
@@ -196,16 +319,20 @@ app.post("/generate", async (req: Request, res: Response) => {
   }
 });
 
-// ── Local dev: start listening ────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Local dev server
+// ---------------------------------------------------------------------------
+
 const PORT = Number(process.env.PORT ?? 3001);
 
 if (require.main === module) {
   app.listen(PORT, () => {
-    console.log(`\n🚀 Sidekick API server running on http://localhost:${PORT}`);
-    console.log(`   POST http://localhost:${PORT}/generate`);
-    console.log(`   GET  http://localhost:${PORT}/health\n`);
+    logger.info("Sidekick API server started", {
+      port: PORT,
+      requireAuth: REQUIRE_AUTH,
+      env: process.env.NODE_ENV ?? "development",
+    });
   });
 }
 
-// ── Vercel serverless export ──────────────────────────────────────────────
 export default app;
