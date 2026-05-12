@@ -241,6 +241,7 @@ function needsPopupRepair(sourceCode: SourceCode): boolean {
   return false;
 }
 
+
 function ensurePremiumPopup(sourceCode: SourceCode, state: ExtensyState): SourceCode {
   if (!needsPopupRepair(sourceCode)) return sourceCode;
 
@@ -277,7 +278,7 @@ function ensurePremiumPopup(sourceCode: SourceCode, state: ExtensyState): Source
         </svg>
       </div>
       <div>
-        <p class="eyebrow">Chrome utility</p>
+        <p class="eyebrow">Chrome extension</p>
         <h1>${escapeHtml(name)}</h1>
       </div>
     </header>
@@ -298,7 +299,7 @@ function ensurePremiumPopup(sourceCode: SourceCode, state: ExtensyState): Source
     </section>
 
     <section class="feature">
-      <span class="label">Primary behavior</span>
+      <span class="label">Behavior</span>
       <p>${escapeHtml(primaryFeature)}</p>
     </section>
 
@@ -316,155 +317,175 @@ function ensurePremiumPopup(sourceCode: SourceCode, state: ExtensyState): Source
 
   const popupCss = `:root {
   color-scheme: light;
-  --canvas: #f4f0e8;
-  --paper: #fffaf1;
-  --ink: #17130f;
-  --muted: #74695e;
-  --line: rgba(23, 19, 15, 0.14);
-  --accent: #0f766e;
-  --accent-ink: #f8fffb;
-  --shadow: 0 18px 55px rgba(23, 19, 15, 0.14);
+  --bg: #f5f5f4;
+  --surface: #ffffff;
+  --ink: #0f0f0f;
+  --ink-2: #3d3d3d;
+  --muted: #8c8c8c;
+  --border: #e8e8e7;
 }
 
-* { box-sizing: border-box; }
+*,
+*::before,
+*::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 html,
 body {
-  margin: 0;
   min-width: 360px;
   min-height: 480px;
-  background: var(--canvas);
+  background: var(--bg);
   color: var(--ink);
-  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
 }
 
-body {
-  display: grid;
-  place-items: stretch;
-}
+body { display: grid; place-items: start stretch; }
 
 .shell {
   width: 360px;
   min-height: 480px;
-  padding: 22px;
-  display: grid;
-  grid-template-rows: auto auto auto 1fr auto;
-  gap: 18px;
-  background:
-    linear-gradient(135deg, rgba(15, 118, 110, 0.12), transparent 32%),
-    var(--paper);
-  border: 1px solid var(--line);
-  box-shadow: var(--shadow);
+  background: var(--surface);
+  display: flex;
+  flex-direction: column;
 }
 
 .hero {
-  display: grid;
-  grid-template-columns: 48px 1fr;
-  gap: 14px;
+  padding: 18px 20px 16px;
+  display: flex;
   align-items: center;
+  gap: 11px;
+  border-bottom: 1px solid var(--border);
 }
 
 .mark {
-  width: 48px;
-  height: 48px;
-  display: grid;
-  place-items: center;
-  color: var(--accent);
-  border: 1px solid color-mix(in srgb, var(--accent), transparent 68%);
-  background: rgba(15, 118, 110, 0.09);
+  width: 32px;
+  height: 32px;
+  background: var(--ink);
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
 }
 
 .mark svg {
-  width: 27px;
-  height: 27px;
-  fill: currentColor;
+  width: 16px;
+  height: 16px;
+  fill: #ffffff;
 }
 
-.eyebrow,
-.label,
-.note {
-  margin: 0;
-  font-size: 11px;
-  line-height: 1.2;
-  letter-spacing: 0.08em;
+.eyebrow {
+  font-size: 10px;
+  letter-spacing: 0.05em;
   text-transform: uppercase;
   color: var(--muted);
+  line-height: 1;
+  margin-bottom: 3px;
 }
 
 h1 {
-  margin: 3px 0 0;
-  font-size: 26px;
-  line-height: 1.02;
-  font-weight: 760;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.2;
+  letter-spacing: -0.015em;
+  color: var(--ink);
 }
 
-.summary,
-.feature,
-.status-grid > div {
-  border-top: 1px solid var(--line);
-  padding-top: 14px;
+.summary {
+  padding: 14px 20px;
+  border-bottom: 1px solid var(--border);
 }
 
-.summary p,
-.feature p {
-  margin: 0;
-  font-size: 14px;
-  line-height: 1.55;
-  color: color-mix(in srgb, var(--ink), var(--muted) 24%);
+.summary p {
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--ink-2);
 }
 
 .status-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.status-grid > div {
+  padding: 12px 20px;
+}
+
+.status-grid > div + div {
+  border-left: 1px solid var(--border);
+}
+
+.label {
+  font-size: 9.5px;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--muted);
+  display: block;
+  margin-bottom: 4px;
 }
 
 strong {
-  display: block;
-  margin-top: 5px;
-  font-size: 14px;
-  line-height: 1.25;
-  font-weight: 680;
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.35;
+  color: var(--ink);
+}
+
+.feature {
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+}
+
+.feature p {
+  margin-top: 4px;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--ink-2);
 }
 
 footer {
-  display: grid;
-  gap: 10px;
-  align-self: end;
+  margin-top: auto;
+  padding: 16px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
 }
 
 button {
   width: 100%;
-  min-height: 46px;
-  padding: 0 14px 0 16px;
-  display: inline-flex;
+  height: 38px;
+  padding: 0 14px;
+  display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  border: 0;
-  background: var(--accent);
-  color: var(--accent-ink);
-  font: inherit;
-  font-size: 14px;
-  font-weight: 720;
+  background: var(--ink);
+  color: #ffffff;
+  border: none;
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 500;
+  letter-spacing: -0.005em;
   cursor: pointer;
-  transition: transform 160ms ease, background-color 160ms ease;
+  transition: opacity 100ms ease;
 }
 
-button:hover { background: #0b625d; }
-button:active { transform: scale(0.985); }
-button:focus-visible { outline: 3px solid rgba(15, 118, 110, 0.25); outline-offset: 3px; }
+button:hover { opacity: 0.82; }
+button:active { opacity: 0.65; }
+button:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
 
 button svg {
-  width: 18px;
-  height: 18px;
+  width: 13px;
+  height: 13px;
   fill: currentColor;
+  opacity: 0.55;
 }
 
 .note {
-  text-transform: none;
-  letter-spacing: 0;
-  line-height: 1.45;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--muted);
 }`;
 
   const popupJs = sourceCode["popup.js"] && !/getElementById\(['"]primary-action/.test(sourceCode["popup.js"])
@@ -1601,12 +1622,14 @@ Your task is to completely eliminate generic 'vibecoded' UI and apply a highly s
 Strict Design Rules:
 1. DESIGN PROFILE: You must strictly apply the "${state.blueprint?.design_profile || 'Editorial Utility'}" design profile.
 2. RESEARCH CONTEXT: Use relevant color codes, spacing, and border radii from the Nia Design Inspiration context below, but translate them into plain CSS. Do not use Tailwind or utility classes.
-3. EDITORIAL UTILITY DIRECTION: Use a warm off-white canvas, deep ink text, one restrained accent, left-aligned hierarchy, mono metadata labels, and asymmetrical composition. Avoid SaaS dashboard tropes, glow effects, centered hero blocks, purple/blue AI gradients, and card spam.
-4. FOUNDATION: Use system UI font stacks so the popup is self-contained. Use high-quality inline SVGs configured with \`currentColor\`; do not use emojis for icons.
-5. MICRO-INTERACTIONS: Keep motion minimal and tactile with raw CSS transitions and \`:active\` transforms. Do not write framework-only animation tokens.
-6. SPACING: Use a strict 4-point spacing scale and strong whitespace rhythm. Not every section should be boxed.
-7. CHROME EXTENSION CONSTRAINTS: Popup UI must be raw static HTML, CSS, and JS. Never use \`@tailwind\`, \`@apply\`, utility-class soup, CDN imports, external font imports, React/Vue/Svelte syntax, TypeScript-only syntax, or build-step CSS.
-8. FILE BOUNDARY: Edit only existing popup/options/sidepanel/content HTML, CSS, and JS files. Do not return \`manifest.json\`, background workers, connector libraries, package files, or unrelated app files.
+3. EDITORIAL UTILITY DIRECTION: Use a warm off-white canvas (light) or deep charcoal canvas (dark), deep ink text, one restrained accent, left-aligned hierarchy, mono metadata labels, and asymmetrical composition. Avoid SaaS dashboard tropes, glow effects, centered hero blocks, and card spam.
+4. COLOR DISCIPLINE — ABSOLUTE BAN: NEVER use #FF00FF, #00FFFF, neon green, electric violet, hot pink, bright indigo (#4B5BFF or similar), cyan (#22D3EE or similar), or any saturated HSL color with lightness above 70% on a dark background. These colors look amateur and AI-generated. Instead use: warm neutrals (copper, stone, parchment), muted earth tones, cool graphite, or a single restrained accent that could appear in editorial print design. The "Editorial Utility" palette is the gold standard: warm off-white canvas, deep ink, one accent (e.g. teal #0f766e, copper #D4A574, sage #6B7E70, slate #4A6572). Adapt the accent to the extension's purpose — security tools get cooler slate-blues, media tools get warmer ambers, productivity tools get warm copper or sage.
+5. NO PURPLE/BLUE AI GRADIENTS: Never produce gradients from purple to blue, violet to pink, cyan to indigo, or any combination that reads as "AI brand aesthetic." A single-color gradient (light to dark of the same hue) is acceptable if subtle.
+6. FOUNDATION: Use system UI font stacks so the popup is self-contained. Use high-quality inline SVGs configured with \`currentColor\`; do not use emojis for icons.
+7. MICRO-INTERACTIONS: Keep motion minimal and tactile with raw CSS transitions and \`:active\` transforms. Do not write framework-only animation tokens.
+8. SPACING: Use a strict 4-point spacing scale and strong whitespace rhythm. Not every section should be boxed.
+9. CHROME EXTENSION CONSTRAINTS: Popup UI must be raw static HTML, CSS, and JS. Never use \`@tailwind\`, \`@apply\`, utility-class soup, CDN imports, external font imports, React/Vue/Svelte syntax, TypeScript-only syntax, or build-step CSS.
+10. FILE BOUNDARY: Edit only existing popup/options/sidepanel/content HTML, CSS, and JS files. Do not return \`manifest.json\`, background workers, connector libraries, package files, or unrelated app files.
 
 Return ONLY a JSON object where each key is a relative file path (same as provided) and each value is the strictly formatted stringified file content.
 Example: { "popup.html": "...", "popup.css": "..." }
