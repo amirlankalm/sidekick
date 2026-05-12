@@ -210,6 +210,62 @@ function escapeHtml(input: string): string {
     .replace(/'/g, "&#39;");
 }
 
+function extractHttpsHosts(input: string): Set<string> {
+  const hosts = new Set<string>();
+  const urlPattern = /https:\/\/[a-z0-9.-]+(?::\d+)?(?:\/[^\s"'`<>)\\]*)?/gi;
+  let match: RegExpExecArray | null;
+
+  while ((match = urlPattern.exec(input)) !== null) {
+    try {
+      hosts.add(new URL(match[0]).hostname.toLowerCase());
+    } catch {
+      // Ignore malformed URL-like strings; runtime/schema validation catches real breakage.
+    }
+  }
+
+  return hosts;
+}
+
+function buildEndpointGroundingText(state: ExtensyState): string {
+  const blueprint = state.blueprint;
+  return [
+    state.user_prompt,
+    state.research_context,
+    blueprint?.description,
+    blueprint?.raw_requirements,
+    ...(blueprint?.features ?? []).flatMap((feature) => [
+      feature.summary,
+      feature.implementation_hint ?? "",
+    ]),
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function findUngroundedExternalEndpoints(
+  sourceCode: SourceCode,
+  state: ExtensyState
+): string[] {
+  const generatedText = Object.values(sourceCode).join("\n");
+  const groundingHosts = extractHttpsHosts(buildEndpointGroundingText(state));
+  const generatedUrls = generatedText.match(/https:\/\/[a-z0-9.-]+(?::\d+)?(?:\/[^\s"'`<>)\\]*)?/gi) ?? [];
+  const ungrounded = new Set<string>();
+
+  for (const rawUrl of generatedUrls) {
+    try {
+      const url = new URL(rawUrl);
+      const host = url.hostname.toLowerCase();
+      if (host === "localhost" || host === "127.0.0.1" || host.endsWith(".local")) continue;
+      if (groundingHosts.has(host)) continue;
+      ungrounded.add(rawUrl);
+    } catch {
+      // Ignore malformed URL-like strings.
+    }
+  }
+
+  return [...ungrounded];
+}
+
 function resolveGeneratedExtensionName(sourceCode: SourceCode, state: ExtensyState): string {
   const manifestSource = sourceCode["manifest.json"];
   if (manifestSource) {
@@ -1476,6 +1532,8 @@ Rules:
 - Never use eval() or inline scripts (CSP compliance)
 - Service workers must follow MV3 patterns (no persistent background pages)
 - All external requests must use host_permissions declared in the manifest
+- Never invent third-party API endpoints, domains, SDK URLs, or SaaS names. External APIs are allowed only when the exact endpoint/domain is present in the user request, connector prompt, or research context.
+- For AI features like Gmail/email summarization without an explicitly provided AI provider endpoint, implement a deterministic local fallback (for example extractive summarization in contentScript.js/popup.js) or a settings UI where the user can enter their own provider endpoint/key. Do not call made-up services such as api.ai-summarizer.com.
 - If auth, database, or payments are part of the product, wire the provided Extensy connector modules instead of inventing raw provider glue
 - Maintain pristine, highly readable code formatting with correct indentation and newlines in your stringified content. Never minify the code!
 - Output ONLY the JSON map — no markdown fences, no prose`;
@@ -1580,6 +1638,19 @@ Rules:
     ...sourceCode,
     ...connectorFiles,
   };
+  const ungroundedEndpoints = findUngroundedExternalEndpoints(withConnectorFiles, state);
+  if (ungroundedEndpoints.length > 0) {
+    log.error("Generated ungrounded external endpoints", {
+      endpoints: ungroundedEndpoints,
+    });
+    return {
+      error:
+        "coder_node: Generated ungrounded external endpoint(s): " +
+        ungroundedEndpoints.join(", ") +
+        ". Only use endpoints explicitly present in the user prompt, connector prompt, or Nia/research context.",
+    };
+  }
+
   const patchedSourceCode = normalizeGeneratedManifest(
     patchManifestForConnectors(withConnectorFiles, connectors)
   );
