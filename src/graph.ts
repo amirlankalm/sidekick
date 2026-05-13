@@ -58,6 +58,8 @@ import {
   type SourceCode,
   type PromoBrief,
   type PublishingBrief,
+  type DesignBrief,
+  type SidekickPlan,
 } from "./state";
 import {
   getArchitectLLM,
@@ -69,7 +71,17 @@ import {
 } from "./llm_config";
 import { runDevToolsDiagnostics } from "./devtools_mcp";
 import { logger } from "./logger";
-import { BlueprintSchema, SourceCodeSchema, validateSchema } from "./schemas";
+import {
+  BlueprintSchema,
+  DesignBriefSchema,
+  SidekickPlanSchema,
+  SourceCodeSchema,
+  validateSchema,
+} from "./schemas";
+import { bus } from "./bus";
+import { createToolContext, evaluatePermission, type ToolContext } from "./tools/registry";
+import { launchPersistentContext, mkdir, rm, runCommand, writeTextFile } from "./tools/wrappers";
+import { parallelBatch } from "./tools/batch";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -83,6 +95,7 @@ const TMP_EXT_DIR = path.join(os.tmpdir(), "sidekick", "extension");
 
 /** Where the assembled ZIP is written (local dev only; skipped on Vercel) */
 const OUTPUT_DIR = path.join(os.tmpdir(), "sidekick", "output");
+const SIDEKICK_WORKTREE = path.join(os.tmpdir(), "sidekick");
 const ALLOWED_DOC_HOSTS = new Set([
   "developer.chrome.com",
   "chrome.jscn.org",
@@ -121,18 +134,38 @@ function getSupabaseClient() {
  * Existing files are overwritten — this is deliberate so that QA retries
  * always test the freshest generated code.
  */
-async function writeExtensionToDisk(sourceCode: SourceCode): Promise<void> {
-  await fs.mkdir(TMP_EXT_DIR, { recursive: true });
+function configureNodeContext(state: ExtensyState): ToolContext {
+  return createToolContext({
+    sessionId: state.requestId,
+    tier: state.subscription_tier,
+    worktree: SIDEKICK_WORKTREE,
+    directory: SIDEKICK_WORKTREE,
+  });
+}
 
-  for (const [relativePath, content] of Object.entries(sourceCode)) {
+function publishPhase(state: ExtensyState, node: string, message: string): void {
+  bus.publish({ type: "phase.started", requestId: state.requestId, node, message });
+}
+
+async function writeExtensionToDisk(ctx: ToolContext, sourceCode: SourceCode): Promise<void> {
+  await mkdir(ctx, TMP_EXT_DIR);
+
+  await parallelBatch(
+    ctx,
+    Object.entries(sourceCode).map(([relativePath, content]) => ({
+      tool: "fs.writeFile",
+      args: { path: relativePath, size: Buffer.byteLength(content) },
+      async run() {
     const normalizedPath = path.normalize(relativePath).replace(/^(\.\.(\/|\\|$))+/, "");
     const absolute = path.resolve(TMP_EXT_DIR, normalizedPath);
     if (!absolute.startsWith(`${TMP_EXT_DIR}${path.sep}`) && absolute !== TMP_EXT_DIR) {
       throw new Error(`[graph] Refusing to write file outside extension root: ${relativePath}`);
     }
-    await fs.mkdir(path.dirname(absolute), { recursive: true });
-    await fs.writeFile(absolute, content, "utf-8");
-  }
+        await writeTextFile(ctx, absolute, content);
+      },
+    })),
+    5
+  );
 
   logger.info("Extension written to disk", {
     node: "writeExtensionToDisk",
@@ -290,6 +323,13 @@ function needsPopupRepair(sourceCode: SourceCode): boolean {
   ].filter(Boolean).join("\n");
 
   if (!css.trim()) return true;
+  if (!/<!doctype html>|<html[\s>]/i.test(popupHtml)) return true;
+  if (!/<body[\s>]/i.test(popupHtml)) return true;
+  if (!/<button[\s\S]*id=["']primary-action["']/i.test(popupHtml)) return true;
+  if (!/aria-label=["']Status["']/i.test(popupHtml)) return true;
+  if (!/--(surface|bg|ink|text|primary)\s*:/i.test(css)) return true;
+  if (!/min-height\s*:\s*(4[0-9]{2}|[5-9][0-9]{2})px/i.test(css)) return true;
+  if (!/transition\s*:/i.test(css)) return true;
   if (/@tailwind\b|@apply\b|class=["'][^"']*\b(text-|bg-|p-|px-|py-|mt-|rounded-|duration-|ease-|active:|hover:)/i.test(`${popupHtml}\n${css}`)) {
     return true;
   }
@@ -544,7 +584,7 @@ button svg {
   color: var(--muted);
 }`;
 
-  const popupJs = sourceCode["popup.js"] && !/getElementById\(['"]primary-action/.test(sourceCode["popup.js"])
+  const popupJs = sourceCode["popup.js"] && /getElementById\(['"]primary-action/.test(sourceCode["popup.js"])
     ? sourceCode["popup.js"]
     : `document.addEventListener("DOMContentLoaded", () => {
   const button = document.getElementById("primary-action");
@@ -1188,14 +1228,66 @@ function buildConnectorPrompt(connectors: ConnectorKind[]): string {
  */
 function initialRouterFn(
   state: ExtensyState
-): "architect_node" | "coder_node" {
+): "plan_node" | "architect_node" | "coder_node" {
   const log = logger.child({ node: "initial_router", requestId: state.requestId });
+  if (state.plan_mode && !state.planApproved) {
+    log.info("Routing to plan_node (read-only plan mode)");
+    return "plan_node";
+  }
   if (state.subscription_tier === "free" || !state.planning_mode) {
     log.info("Routing to coder_node (free tier or planning disabled)");
     return "coder_node";
   }
   log.info("Routing to architect_node");
   return "architect_node";
+}
+
+// ---------------------------------------------------------------------------
+// Node / Router: plan_node → plan_review_gate
+// ---------------------------------------------------------------------------
+
+async function planNode(state: ExtensyState): Promise<Partial<ExtensyState>> {
+  const log = logger.child({ node: "plan_node", requestId: state.requestId });
+  publishPhase(state, "plan_node", "Drafting read-only implementation plan...");
+  log.info("Generating read-only plan");
+
+  const llm = getArchitectLLM();
+  const response = await llm.invoke([
+    new SystemMessage(`You are Sidekick's read-only planning agent.
+You may inspect requirements and propose architecture, but you must not write files, run shell commands, or modify state outside the returned plan.
+Return ONLY JSON matching:
+{
+  "summary": string,
+  "steps": [{ "node": string, "description": string, "files": string[], "estimatedTokens": number }]
+}`),
+    new HumanMessage(state.user_prompt),
+  ]);
+
+  try {
+    const raw = typeof response.content === "string" ? response.content : JSON.stringify(response.content);
+    const parsed = parseJsonPayload<unknown>(raw);
+    const validation = validateSchema(SidekickPlanSchema, parsed);
+    if (!validation.success) {
+      return { error: `plan_node: Invalid plan JSON — ${validation.error}`, status: "blocked" };
+    }
+
+    const plan = validation.data as SidekickPlan;
+    bus.publish({
+      type: "plan.generated",
+      requestId: state.requestId,
+      summary: plan.summary,
+      steps: plan.steps.map((step) => `${step.node}: ${step.description}`),
+    });
+
+    return { plan, status: "awaiting_review" };
+  } catch (err) {
+    return { error: `plan_node: Failed to parse plan — ${String(err)}`, status: "blocked" };
+  }
+}
+
+function planReviewGateFn(state: ExtensyState): "architect_node" | typeof END {
+  if (state.planApproved) return "architect_node";
+  return END;
 }
 
 // ---------------------------------------------------------------------------
@@ -1210,6 +1302,7 @@ async function architectNode(
   state: ExtensyState
 ): Promise<Partial<ExtensyState>> {
   const log = logger.child({ node: "architect_node", requestId: state.requestId });
+  publishPhase(state, "architect_node", "Analyzing extension architecture...");
   log.info("Planning extension architecture");
 
   const llm = getArchitectLLM();
@@ -1266,14 +1359,14 @@ Respond with ONLY the JSON object — no markdown fences, no prose.`;
 
 function researchRouterFn(
   state: ExtensyState
-): "researcher_node" | "coder_node" {
+): "researcher_node" | "compaction_node" {
   const log = logger.child({ node: "research_router", requestId: state.requestId });
   if (state.subscription_tier === "max" || state.subscription_tier === "pro") {
     log.info("Routing to researcher_node", { tier: state.subscription_tier });
     return "researcher_node";
   }
   log.info("Routing to coder_node (no research on free tier)");
-  return "coder_node";
+  return "compaction_node";
 }
 
 // ---------------------------------------------------------------------------
@@ -1340,7 +1433,9 @@ async function researcherNode(
   state: ExtensyState
 ): Promise<Partial<ExtensyState>> {
   const log = logger.child({ node: "researcher_node", requestId: state.requestId });
+  publishPhase(state, "researcher_node", "Fetching contextual intelligence...");
   log.info("Starting deep research", { tier: state.subscription_tier });
+  const ctx = configureNodeContext(state);
 
   const decomposerLLM  = getDecomposerLLM();   // claude-haiku-4-5 — fast & cheap
   const synthesizerLLM = getArchitectLLM();     // claude-sonnet-4-5 for synthesis
@@ -1401,8 +1496,13 @@ Return ONLY one URL per line — no prose, no numbering, no markdown.`),
   // ── Phase 3: Parallel Web Fetch ──────────────────────────────────────────
   log.info("Phase 3 — Fetching documentation pages", { urlCount: docUrls.length });
 
-  const fetchResults = await Promise.allSettled(
-    docUrls.map(url => fetchDocPage(url))
+  const fetchResults = await parallelBatch(
+    ctx,
+    docUrls.map((url) => ({
+      tool: "fetch",
+      args: { url },
+      run: () => fetchDocPage(url),
+    }))
   );
 
   const webContent = fetchResults
@@ -1484,6 +1584,106 @@ Be specific. Include real endpoint paths, exact CSS classes, real permission nam
   return { research_context: synthesizedBrief };
 }
 
+// ---------------------------------------------------------------------------
+// Node: compaction_node
+// ---------------------------------------------------------------------------
+
+async function compactionNode(state: ExtensyState): Promise<Partial<ExtensyState>> {
+  const log = logger.child({ node: "compaction_node", requestId: state.requestId });
+  publishPhase(state, "compaction_node", "Checking context size...");
+
+  const contextText = [
+    state.user_prompt,
+    state.compacted_context,
+    state.blueprint ? JSON.stringify(state.blueprint) : "",
+    state.research_context,
+    state.devtools_summary,
+    state.verify_error,
+    ...state.qa_logs.map((entry) => `${entry.type}:${entry.level}:${entry.message}`),
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+  const estimatedTokens = Math.ceil(contextText.length / 4);
+  const threshold = state.subscription_tier === "max" ? 12000 : 6000;
+
+  if (estimatedTokens < threshold) {
+    log.info("Context below compaction threshold", { estimatedTokens, threshold });
+    return {};
+  }
+
+  const llm = getArchitectLLM();
+  const response = await llm.invoke([
+    new SystemMessage(
+      "Summarize the following development context into a compact brief. Keep all file decisions, blueprint structures, and unresolved errors. Discard pleasantries and old code snippets that have been superseded."
+    ),
+    new HumanMessage(contextText.slice(-48_000)),
+  ]);
+  const summary =
+    typeof response.content === "string" ? response.content : JSON.stringify(response.content);
+
+  bus.publish({ type: "context.compacted", requestId: state.requestId, summary });
+  return {
+    compacted_context: summary,
+    research_context: state.research_context.slice(-12000),
+    devtools_summary: "",
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Node: design_brief_node
+// ---------------------------------------------------------------------------
+
+async function designBriefNode(state: ExtensyState): Promise<Partial<ExtensyState>> {
+  const log = logger.child({ node: "design_brief_node", requestId: state.requestId });
+  publishPhase(state, "design_brief_node", "Creating structured design brief...");
+
+  if (state.designBrief) return {};
+
+  const llm = getUIDesignerLLM();
+  const response = await llm.invoke([
+    new SystemMessage(`You are an elite Chrome Extension product designer.
+Return ONLY JSON matching:
+{
+  "designTokens": {
+    "colors": { "primary": "", "background": "", "surface": "", "text": "" },
+    "borderRadius": "",
+    "fontFamily": "",
+    "spacingUnit": ""
+  },
+  "componentHierarchy": [{ "name": "PopupRoot", "children": ["Header", "MainContent", "Footer"] }],
+  "layout": "popup",
+  "iconSet": "inline-svg",
+  "responsive": true,
+  "darkMode": "media-query"
+}
+Use restrained editorial utility styling. Avoid purple-blue AI gradients, emojis, external fonts, and framework-only styling.`),
+    new HumanMessage(
+      [
+        `User request:\n${state.user_prompt}`,
+        state.blueprint ? `Blueprint:\n${JSON.stringify(state.blueprint, null, 2)}` : "",
+        state.research_context ? `Research context:\n${state.research_context.slice(0, 12000)}` : "",
+      ]
+        .filter(Boolean)
+        .join("\n\n")
+    ),
+  ]);
+
+  try {
+    const raw = typeof response.content === "string" ? response.content : JSON.stringify(response.content);
+    const parsed = parseJsonPayload<unknown>(raw);
+    const validation = validateSchema(DesignBriefSchema, parsed);
+    if (!validation.success) {
+      log.warn("Design brief validation failed", { validationError: validation.error });
+      return {};
+    }
+
+    return { designBrief: validation.data as DesignBrief };
+  } catch (err) {
+    log.warn("Design brief parse failed", { error: String(err) });
+    return {};
+  }
+}
+
 
 // ---------------------------------------------------------------------------
 // Node: coder_node
@@ -1502,6 +1702,7 @@ async function coderNode(
   const isRetry = state.qa_logs.length > 0 || state.devtools_summary.length > 0;
   const connectors = detectRequiredConnectors(state);
   const log = logger.child({ node: "coder_node", requestId: state.requestId });
+  publishPhase(state, "coder_node", "Writing extension code...");
   log.info("Generating extension code", {
     isRetry,
     attempt: state.qa_retry_count + 1,
@@ -1536,6 +1737,8 @@ Rules:
 - For AI features like Gmail/email summarization without an explicitly provided AI provider endpoint, implement a deterministic local fallback (for example extractive summarization in contentScript.js/popup.js) or a settings UI where the user can enter their own provider endpoint/key. Do not call made-up services such as api.ai-summarizer.com.
 - If auth, database, or payments are part of the product, wire the provided Extensy connector modules instead of inventing raw provider glue
 - Maintain pristine, highly readable code formatting with correct indentation and newlines in your stringified content. Never minify the code!
+- You MUST output file contents only inside the JSON values. Do not wrap code in markdown fences when writing to files.
+- When fixing a localized QA or verification error, preserve unrelated files and make the smallest coherent change.
 - Output ONLY the JSON map — no markdown fences, no prose`;
 
   // ── Build the user prompt with blueprint + research context + QA errors ──
@@ -1555,8 +1758,24 @@ Rules:
     );
   }
 
+  if (state.compacted_context) {
+    parts.push(`## Compacted Development Context\n${state.compacted_context}`);
+  }
+
+  if (state.designBrief) {
+    parts.push(
+      `## Structured Design Brief\n\`\`\`json\n${JSON.stringify(state.designBrief, null, 2)}\n\`\`\`\nAll generated UI must follow these tokens and component hierarchy. Do not arbitrarily deviate.`
+    );
+  }
+
   if (connectors.length > 0) {
     parts.push(buildConnectorPrompt(connectors));
+  }
+
+  if (state.verify_error) {
+    parts.push(
+      `## Static Verification Error — Fix Before Browser QA (attempt ${state.verify_retry_count + 1}/2)\n${state.verify_error}`
+    );
   }
 
   if (isRetry) {
@@ -1655,9 +1874,17 @@ Rules:
     patchManifestForConnectors(withConnectorFiles, connectors)
   );
   const polishedSourceCode = ensurePremiumPopup(patchedSourceCode, state);
+  const fileVersions = Object.fromEntries(
+    Object.keys(polishedSourceCode).map((filePath) => [
+      filePath,
+      (state.fileVersions[filePath] ?? 0) + 1,
+    ])
+  );
 
   return {
     source_code: polishedSourceCode,
+    fileVersions,
+    verify_error: "",
     // Reset qa_logs so only the *current* run's errors flow into the next retry.
     qa_logs: [],
     qa_retry_count: state.qa_retry_count + (isRetry ? 1 : 0),
@@ -1678,6 +1905,7 @@ async function uiDesignerNode(
   state: ExtensyState
 ): Promise<Partial<ExtensyState>> {
   const log = logger.child({ node: "ui_designer_node", requestId: state.requestId });
+  publishPhase(state, "ui_designer_node", "Polishing extension UI...");
   log.info("Enhancing extension UI/UX design");
 
   const llm = getUIDesignerLLM();
@@ -1701,6 +1929,7 @@ Strict Design Rules:
 8. SPACING: Use a strict 4-point spacing scale and strong whitespace rhythm. Not every section should be boxed.
 9. CHROME EXTENSION CONSTRAINTS: Popup UI must be raw static HTML, CSS, and JS. Never use \`@tailwind\`, \`@apply\`, utility-class soup, CDN imports, external font imports, React/Vue/Svelte syntax, TypeScript-only syntax, or build-step CSS.
 10. FILE BOUNDARY: Edit only existing popup/options/sidepanel/content HTML, CSS, and JS files. Do not return \`manifest.json\`, background workers, connector libraries, package files, or unrelated app files.
+11. STRUCTURED BRIEF: If a design brief is provided, obey its tokens, hierarchy, layout, icon set, responsiveness, and dark-mode strategy exactly.
 
 Return ONLY a JSON object where each key is a relative file path (same as provided) and each value is the strictly formatted stringified file content.
 Example: { "popup.html": "...", "popup.css": "..." }
@@ -1708,8 +1937,8 @@ Do not remove functionality or data bindings. Only ENHANCE the styles and struct
 Output ONLY the JSON map — no markdown fences, no prose.`;
 
   const userMessageContent = state.research_context 
-    ? `Nia Design Inspiration Context:\n${state.research_context}\n\nEnhance the UI of the following extension code:\n\n${codeSnapshot}`
-    : `Enhance the UI of the following extension code:\n\n${codeSnapshot}`;
+    ? `Structured Design Brief:\n${JSON.stringify(state.designBrief, null, 2)}\n\nNia Design Inspiration Context:\n${state.research_context}\n\nEnhance the UI of the following extension code:\n\n${codeSnapshot}`
+    : `Structured Design Brief:\n${JSON.stringify(state.designBrief, null, 2)}\n\nEnhance the UI of the following extension code:\n\n${codeSnapshot}`;
 
   const response = await llm.invoke([
     new SystemMessage(systemPrompt),
@@ -1766,9 +1995,102 @@ Output ONLY the JSON map — no markdown fences, no prose.`;
 
 function uiDesignerRouterFn(
   _state: ExtensyState
-): "ui_designer_node" | "qa_node" {
+): "ui_designer_node" | "verify_node" {
   // UI designer runs for all tiers.
   return "ui_designer_node";
+}
+
+// ---------------------------------------------------------------------------
+// Node / Router: verify_node
+// ---------------------------------------------------------------------------
+
+async function verifyNode(state: ExtensyState): Promise<Partial<ExtensyState>> {
+  const log = logger.child({ node: "verify_node", requestId: state.requestId });
+  publishPhase(state, "verify_node", "Running static verification...");
+
+  const ctx = configureNodeContext(state);
+  const permission = evaluatePermission(ctx, "shell", ["static verification"]);
+  if (permission === "deny") {
+    bus.publish({
+      type: "verify.skipped",
+      requestId: state.requestId,
+      reason: "Shell execution is denied for this tier.",
+    });
+    return { verify_error: "" };
+  }
+
+  await writeExtensionToDisk(ctx, state.source_code);
+
+  const packageJson = state.source_code["package.json"];
+  if (packageJson) {
+    try {
+      const pkg = JSON.parse(packageJson) as { scripts?: Record<string, string> };
+      const scripts = pkg.scripts ?? {};
+      const commands: Array<[string, string[]]> = [["npm", ["install"]]];
+      if (scripts.lint) commands.push(["npm", ["run", "lint"]]);
+      if (scripts.typecheck) commands.push(["npm", ["run", "typecheck"]]);
+      if (scripts.build && !scripts.typecheck) commands.push(["npm", ["run", "build"]]);
+
+      for (const [command, args] of commands) {
+        const result = await runCommand(ctx, command, args, { cwd: TMP_EXT_DIR, timeoutMs: 180_000 });
+        if (result.code !== 0) {
+          const error = `${command} ${args.join(" ")} failed\n${result.stdout}\n${result.stderr}`.trim();
+          bus.publish({
+            type: "verify.failed",
+            requestId: state.requestId,
+            error,
+            retryCount: state.verify_retry_count + 1,
+          });
+          return { verify_error: error, verify_retry_count: state.verify_retry_count + 1 };
+        }
+      }
+    } catch (err) {
+      const error = `verify_node: ${String(err)}`;
+      bus.publish({
+        type: "verify.failed",
+        requestId: state.requestId,
+        error,
+        retryCount: state.verify_retry_count + 1,
+      });
+      return { verify_error: error, verify_retry_count: state.verify_retry_count + 1 };
+    }
+  } else {
+    const jsFiles = Object.keys(state.source_code).filter((filePath) => filePath.endsWith(".js"));
+    const results = await parallelBatch(
+      ctx,
+      jsFiles.map((filePath) => ({
+        tool: "node --check",
+        args: { filePath },
+        run: () => runCommand(ctx, "node", ["--check", path.join(TMP_EXT_DIR, filePath)], { cwd: TMP_EXT_DIR }),
+      })),
+      4
+    );
+    const failures = results
+      .filter((result): result is PromiseFulfilledResult<{ code: number; stdout: string; stderr: string }> =>
+        result.status === "fulfilled" && result.value.code !== 0
+      )
+      .map((result) => `${result.value.stdout}\n${result.value.stderr}`.trim())
+      .filter(Boolean);
+
+    if (failures.length > 0) {
+      const error = failures.join("\n\n");
+      bus.publish({
+        type: "verify.failed",
+        requestId: state.requestId,
+        error,
+        retryCount: state.verify_retry_count + 1,
+      });
+      return { verify_error: error, verify_retry_count: state.verify_retry_count + 1 };
+    }
+  }
+
+  log.info("Static verification passed");
+  return { verify_error: "" };
+}
+
+function verifyRouterFn(state: ExtensyState): "compaction_node" | "qa_node" {
+  if (state.verify_error && state.verify_retry_count < 2) return "compaction_node";
+  return "qa_node";
 }
 
 // ---------------------------------------------------------------------------
@@ -1791,6 +2113,7 @@ async function qaNode(
   state: ExtensyState
 ): Promise<Partial<ExtensyState>> {
   const log = logger.child({ node: "qa_node", requestId: state.requestId });
+  publishPhase(state, "qa_node", "Running browser QA...");
 
   if (state.subscription_tier === "free") {
     log.info("Skipping QA for free tier");
@@ -1799,7 +2122,8 @@ async function qaNode(
 
   log.info("Writing extension to disk and launching Playwright");
 
-  await writeExtensionToDisk(state.source_code);
+  const ctx = configureNodeContext(state);
+  await writeExtensionToDisk(ctx, state.source_code);
 
   const logs: QALogEntry[] = [];
 
@@ -1825,7 +2149,7 @@ async function qaNode(
   try {
     if (isVercel) {
       const executablePath = await sparticuzChromium.executablePath();
-      context = await playwrightChromium.launchPersistentContext(userDataDir, {
+      context = await launchPersistentContext(ctx, playwrightChromium, userDataDir, {
         headless: true,
         executablePath,
         args: [...sparticuzChromium.args, ...extensionArgs],
@@ -1833,7 +2157,7 @@ async function qaNode(
         timeout: 45_000,
       });
     } else {
-      context = await playwrightChromium.launchPersistentContext(userDataDir, {
+      context = await launchPersistentContext(ctx, playwrightChromium, userDataDir, {
         headless: true,
         args: extensionArgs,
         ignoreDefaultArgs: ["--disable-extensions"],
@@ -1881,10 +2205,19 @@ async function qaNode(
     if (diagnostics.networkErrors.length > 0)  logs.push(...diagnostics.networkErrors);
     if (diagnostics.domIssues.length > 0)      logs.push(...diagnostics.domIssues);
 
+    logs.forEach((entry) => {
+      bus.publish({
+        type: "qa.diagnostic",
+        requestId: state.requestId,
+        severity: entry.level === "error" ? "error" : entry.level === "warning" ? "warn" : "info",
+        message: entry.message,
+      });
+    });
+
     const devtools_summary = diagnostics.rawSummary;
 
     await context.close();
-    await fs.rm(userDataDir, { recursive: true, force: true }).catch((cleanupErr) => {
+    await rm(ctx, userDataDir).catch((cleanupErr) => {
       log.warn("Failed to remove Chromium user data dir", {
         path: userDataDir,
         error: String(cleanupErr),
@@ -1905,7 +2238,7 @@ async function qaNode(
     if (context) {
       try { await context.close(); } catch {}
     }
-    await fs.rm(userDataDir, { recursive: true, force: true }).catch((cleanupErr) => {
+    await rm(configureNodeContext(state), userDataDir).catch((cleanupErr) => {
       log.warn("Failed to remove Chromium user data dir in finally", {
         path: userDataDir,
         error: String(cleanupErr),
@@ -1965,7 +2298,7 @@ async function getAvailablePort(): Promise<number> {
 
 function qaRouterFn(
   state: ExtensyState
-): "coder_node" | "fan_out_router" {
+): "compaction_node" | "fan_out_router" {
   const log = logger.child({ node: "qa_router", requestId: state.requestId });
 
   if (state.error) {
@@ -1978,7 +2311,7 @@ function qaRouterFn(
       issueCount: state.qa_logs.length,
       retry: `${state.qa_retry_count + 1}/${MAX_QA_RETRIES}`,
     });
-    return "coder_node";
+    return "compaction_node";
   }
 
   if (state.qa_logs.length > 0 && state.qa_retry_count >= MAX_QA_RETRIES) {
@@ -2032,6 +2365,7 @@ async function legalNode(
   state: ExtensyState
 ): Promise<Partial<ExtensyState>> {
   const log = logger.child({ node: "legal_node", requestId: state.requestId });
+  publishPhase(state, "legal_node", "Generating legal documents...");
   log.info("Generating legal documents");
 
   const llm = getLegalLLM(); // Haiku — cost-efficient for doc generation
@@ -2137,6 +2471,7 @@ async function integrationNode(
   state: ExtensyState
 ): Promise<Partial<ExtensyState>> {
   const log = logger.child({ node: "integration_node", requestId: state.requestId });
+  publishPhase(state, "integration_node", "Auditing integrations...");
   log.info("Auditing and wiring third-party integrations");
 
   const connectors = detectRequiredConnectors(state);
@@ -2211,6 +2546,7 @@ async function assemblerNode(
   state: ExtensyState
 ): Promise<Partial<ExtensyState>> {
   const log = logger.child({ node: "assembler_node", requestId: state.requestId });
+  publishPhase(state, "assembler_node", "Packaging extension artifact...");
   log.info("Assembling final Chrome Extension ZIP");
 
   const zip = new JSZip();
@@ -2252,10 +2588,15 @@ async function assemblerNode(
 
   if (!isVercel) {
     try {
-      await fs.mkdir(OUTPUT_DIR, { recursive: true });
       const zipBuffer = await zip.generateAsync({ type: "nodebuffer" });
       artifactPath = path.join(OUTPUT_DIR, `${extensionName}_${timestamp}.zip`);
-      await fs.writeFile(artifactPath, zipBuffer);
+      if (state.subscription_tier === "free") {
+        artifactPath = `in-memory:${extensionName}_${timestamp}.zip`;
+      } else {
+        const ctx = configureNodeContext(state);
+        await mkdir(ctx, OUTPUT_DIR);
+        await writeTextFile(ctx, artifactPath, zipBuffer);
+      }
       log.info("Extension ZIP written to disk", { path: artifactPath });
     } catch (err) {
       log.warn("ZIP write failed (non-fatal)", { error: String(err) });
@@ -2264,11 +2605,14 @@ async function assemblerNode(
     log.info("Extension ready (Vercel — in-memory only)", { name: extensionName });
   }
 
+  bus.publish({ type: "complete", requestId: state.requestId, artifactPath });
+
   return {
     artifact_path: artifactPath,
     source_code: sourceCode,
     promo_brief: promoBrief,
     publishing_brief: publishingBrief,
+    status: "complete",
   };
 }
 
@@ -2293,10 +2637,14 @@ function buildGraph() {
   // We therefore keep a typed reference only for `.compile()` and use
   // `(graph as any)` for all addEdge / addConditionalEdges calls — this is
   // the official LangGraph recommendation for complex multi-node graphs.
+  graph.addNode("plan_node", planNode);
   graph.addNode("architect_node", architectNode);
   graph.addNode("researcher_node", researcherNode);
+  graph.addNode("compaction_node", compactionNode);
+  graph.addNode("design_brief_node", designBriefNode);
   graph.addNode("coder_node", coderNode);
   graph.addNode("ui_designer_node", uiDesignerNode);
+  graph.addNode("verify_node", verifyNode);
   graph.addNode("qa_node", qaNode);
   graph.addNode("legal_node", legalNode);
   graph.addNode("integration_node", integrationNode);
@@ -2312,17 +2660,23 @@ function buildGraph() {
   // ── START → initial router ────────────────────────────────────────────────
   g.addConditionalEdges(START, initialRouterFn);
 
+  // ── plan_node → approval gate ────────────────────────────────────────────
+  g.addConditionalEdges("plan_node", planReviewGateFn);
+
   // ── architect_node → research router ─────────────────────────────────────
   g.addConditionalEdges("architect_node", researchRouterFn);
 
-  // ── researcher_node → coder_node ─────────────────────────────────────────
-  g.addEdge("researcher_node", "coder_node");
+  // ── researcher_node → compaction → design brief → coder ─────────────────
+  g.addEdge("researcher_node", "compaction_node");
+  g.addEdge("compaction_node", "design_brief_node");
+  g.addEdge("design_brief_node", "coder_node");
 
   // ── coder_node → ui_designer_router ──────────────────────────────────────
   g.addConditionalEdges("coder_node", uiDesignerRouterFn);
 
-  // ── ui_designer_node → qa_node ───────────────────────────────────────────
-  g.addEdge("ui_designer_node", "qa_node");
+  // ── ui_designer_node → verify_node → qa_node ────────────────────────────
+  g.addEdge("ui_designer_node", "verify_node");
+  g.addConditionalEdges("verify_node", verifyRouterFn);
 
   // ── qa_node → qa router (retry loop or proceed) ──────────────────────────
   g.addConditionalEdges("qa_node", qaRouterFn);
@@ -2380,5 +2734,22 @@ async function main() {
 if (require.main === module) {
   main();
 }
+
+export const __test__ = {
+  architectNode,
+  planNode,
+  compactionNode,
+  designBriefNode,
+  coderNode,
+  uiDesignerNode,
+  researcherNode,
+  qaNode,
+  legalNode,
+  integrationNode,
+  verifyNode,
+  assemblerNode,
+  ensurePremiumPopup,
+  findUngroundedExternalEndpoints,
+};
 
 export { buildGraph };

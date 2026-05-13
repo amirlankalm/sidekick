@@ -92,6 +92,40 @@ export interface PublishingBrief {
   upload_readiness_checks: string[];
 }
 
+export interface DesignBrief {
+  designTokens: {
+    colors: {
+      primary: string;
+      background: string;
+      surface: string;
+      text: string;
+    };
+    borderRadius: string;
+    fontFamily: string;
+    spacingUnit: string;
+  };
+  componentHierarchy: Array<{
+    name: string;
+    children: string[];
+  }>;
+  layout: "popup" | "sidebar" | "fullpage";
+  iconSet: "lucide" | "inline-svg";
+  responsive: boolean;
+  darkMode: "class" | "media-query" | "none";
+}
+
+export interface PlanStep {
+  node: string;
+  description: string;
+  files: string[];
+  estimatedTokens: number;
+}
+
+export interface SidekickPlan {
+  summary: string;
+  steps: PlanStep[];
+}
+
 /**
  * SubscriptionTier — enforced at the initial router.
  * Free  → minimal model, no planning, no legal, basic assembler
@@ -147,6 +181,27 @@ export const StateAnnotation = Annotation.Root({
     default: () => true,
   }),
 
+  /**
+   * OpenCode-style plan mode is read-only and pauses for explicit approval
+   * before any code-generating node can run.
+   */
+  plan_mode: Annotation<boolean>({
+    reducer: (_, next) => next,
+    default: () => false,
+  }),
+
+  /** Set by POST /approve-plan when an external client resumes the run. */
+  planApproved: Annotation<boolean>({
+    reducer: (_, next) => next,
+    default: () => false,
+  }),
+
+  /** Current graph status for frontend orchestration. */
+  status: Annotation<"running" | "awaiting_review" | "complete" | "blocked">({
+    reducer: (_, next) => next,
+    default: () => "running",
+  }),
+
   /** The author username passed from Extensy */
   author: Annotation<string>({
     reducer: (_, next) => next,
@@ -179,6 +234,12 @@ export const StateAnnotation = Annotation.Root({
     default: () => "",
   }),
 
+  /** Compact brief produced when repeated loops start bloating context. */
+  compacted_context: Annotation<string>({
+    reducer: (_, next) => next,
+    default: () => "",
+  }),
+
   /**
    * Rich diagnostics from Chrome DevTools MCP.
    * Captured during the qa_node execution.
@@ -195,6 +256,36 @@ export const StateAnnotation = Annotation.Root({
   source_code: Annotation<SourceCode>({
     reducer: (_, next) => next,
     default: () => ({}),
+  }),
+
+  /** Structured plan emitted by plan_node. */
+  plan: Annotation<SidekickPlan | null>({
+    reducer: (_, next) => next,
+    default: () => null,
+  }),
+
+  /** Structured design contract consumed by coder_node and UI polish. */
+  designBrief: Annotation<DesignBrief | null>({
+    reducer: (_, next) => next,
+    default: () => null,
+  }),
+
+  /** Per-file monotonically increasing version map for diff-aware clients. */
+  fileVersions: Annotation<Record<string, number>>({
+    reducer: (existing, incoming) => ({ ...existing, ...incoming }),
+    default: () => ({}),
+  }),
+
+  /** Static verification retry count before browser QA. */
+  verify_retry_count: Annotation<number>({
+    reducer: (_, next) => next,
+    default: () => 0,
+  }),
+
+  /** Last static verification error injected into coder_node on retries. */
+  verify_error: Annotation<string>({
+    reducer: (_, next) => next,
+    default: () => "",
   }),
 
   /** Public Privacy Policy URL generated alongside the Terms URL. */

@@ -30,6 +30,7 @@ import { createClient } from "@supabase/supabase-js";
 import { buildGraph } from "./graph";
 import { logger } from "./logger";
 import type { ExtensyState } from "./state";
+import { bus } from "./bus";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -156,10 +157,14 @@ app.get("/health", (_req, res) => {
 const VALID_TIERS = new Set(["free", "pro", "max"]);
 
 const PHASE_MESSAGES: Record<string, string> = {
+  plan_node:        "Drafting read-only plan...",
   architect_node:   "Analyzing your prompt...",
   researcher_node:  "Fetching Chrome Extension docs...",
+  compaction_node:  "Compacting context...",
+  design_brief_node:"Creating design brief...",
   coder_node:       "Writing extension code...",
   ui_designer_node: "Polishing popup UI...",
+  verify_node:      "Running static verification...",
   qa_node:          "Running QA tests in Chromium...",
   devtools_node:    "Performing deep DevTools diagnostics...",
   fan_out_router:   "Preparing final steps...",
@@ -167,6 +172,43 @@ const PHASE_MESSAGES: Record<string, string> = {
   integration_node: "Wiring third-party integrations...",
   assembler_node:   "Packaging your extension...",
 };
+
+const approvedPlans = new Set<string>();
+
+app.post("/respond-permission", async (req: Request, res: Response) => {
+  const { id, resolution } = req.body as {
+    id?: string;
+    resolution?: "allow" | "deny" | "always";
+  };
+
+  if (!id || !resolution || !["allow", "deny", "always"].includes(resolution)) {
+    res.status(400).json({ error: "id and resolution=allow|deny|always are required" });
+    return;
+  }
+
+  const resolved = bus.resolvePermission(id, resolution);
+  if (!resolved) {
+    res.status(404).json({ error: "permission request not found or already resolved" });
+    return;
+  }
+
+  res.json({ ok: true });
+});
+
+app.post("/approve-plan", async (req: Request, res: Response) => {
+  const { requestId } = req.body as { requestId?: string };
+  if (!requestId) {
+    res.status(400).json({ error: "requestId is required" });
+    return;
+  }
+
+  approvedPlans.add(requestId);
+  res.json({
+    ok: true,
+    requestId,
+    resume: "Call /generate again with the same requestId and planApproved=true to continue.",
+  });
+});
 
 app.post("/generate", generateLimiter, async (req: Request, res: Response) => {
   const requestId = randomUUID();
@@ -203,14 +245,20 @@ app.post("/generate", generateLimiter, async (req: Request, res: Response) => {
     prompt,
     subscription_tier = "free",
     planning_mode = true,
+    plan_mode = false,
+    planApproved = false,
     author = "user",
     tos_id = "",
+    requestId: requestedRequestId,
   } = req.body as {
     prompt?: string;
     subscription_tier?: string;
     planning_mode?: boolean;
+    plan_mode?: boolean;
+    planApproved?: boolean;
     author?: string;
     tos_id?: string;
+    requestId?: string;
   };
 
   if (!prompt?.trim()) {
@@ -224,6 +272,8 @@ app.post("/generate", generateLimiter, async (req: Request, res: Response) => {
   }
 
   const safeTier = subscription_tier as "free" | "pro" | "max";
+  const effectiveRequestId = requestedRequestId?.trim() || requestId;
+  const approved = planApproved || approvedPlans.has(effectiveRequestId);
 
   log.info("/generate request received", {
     userId,
@@ -235,22 +285,29 @@ app.post("/generate", generateLimiter, async (req: Request, res: Response) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
-  res.setHeader("X-Request-Id", requestId);
+  res.setHeader("X-Request-Id", effectiveRequestId);
   res.flushHeaders();
 
   const emit = (event: string, data: unknown) => {
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
   };
 
+  const unsubscribe = bus.subscribeAll((event) => {
+    if (event.requestId && event.requestId !== effectiveRequestId) return;
+    emit(event.type, event);
+  });
+
   try {
     const graph = buildGraph();
 
     const stream = graph.streamEvents(
       {
-        requestId,
+        requestId: effectiveRequestId,
         user_prompt: prompt.trim(),
         subscription_tier: safeTier,
         planning_mode,
+        plan_mode,
+        planApproved: approved,
         author: author.trim().slice(0, 120),
         tos_id: tos_id.trim().slice(0, 120),
       } as Partial<ExtensyState>,
@@ -262,6 +319,7 @@ app.post("/generate", generateLimiter, async (req: Request, res: Response) => {
     for await (const event of stream) {
       if (event.event === "on_chain_start" && event.name in PHASE_MESSAGES) {
         emit("phase", {
+          type: "phase.started",
           node: event.name,
           message: PHASE_MESSAGES[event.name] ?? event.name,
         });
@@ -274,6 +332,16 @@ app.post("/generate", generateLimiter, async (req: Request, res: Response) => {
 
     if (!finalState) {
       emit("error", { message: "Pipeline completed but produced no output" });
+      res.end();
+      return;
+    }
+
+    if (finalState.status === "awaiting_review") {
+      emit("awaiting_review", {
+        type: "plan.awaiting_review",
+        requestId: effectiveRequestId,
+        plan: finalState.plan,
+      });
       res.end();
       return;
     }
@@ -315,6 +383,7 @@ app.post("/generate", generateLimiter, async (req: Request, res: Response) => {
       message: err instanceof Error ? err.message : String(err),
     });
   } finally {
+    unsubscribe();
     res.end();
   }
 });

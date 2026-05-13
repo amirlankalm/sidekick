@@ -6,7 +6,7 @@
  * isolated from provider-specific details.
  */
 
-import type { BaseMessage } from "@langchain/core/messages";
+import { SystemMessage, type BaseMessage } from "@langchain/core/messages";
 import type { SubscriptionTier } from "./state";
 import { logger } from "./logger";
 
@@ -53,9 +53,23 @@ interface InvocationResult {
   content: string;
 }
 
+export const OPENCODE_SYSTEM_DISCIPLINE = `You are an autonomous coding agent. Follow these rules:
+- Be concise. Answer in 1-3 sentences or a short paragraph unless asked for detail. No introductions, no conclusions, no summaries.
+- Never explain your code unless the user explicitly asks. After writing or editing, just stop.
+- Do not use emojis unless explicitly requested.
+- When multiple independent files or searches are needed, execute them in parallel in a single batch.
+- Run linting/typechecking after all edits before declaring the task complete.
+- Never commit changes to git or write to .env files unless explicitly asked.
+- Before editing, check the existing file's conventions (naming, imports, quote style) and mimic them exactly.
+- If you cannot do something, state it in one sentence and offer an alternative. Do not preach.`;
+
 export interface SidekickLLM {
   invoke(messages: BaseMessage[]): Promise<InvocationResult>;
 }
+
+type LLMFactoryOverride = ((options: LLMFactoryOptions) => SidekickLLM) | null;
+
+let llmFactoryOverride: LLMFactoryOverride = null;
 
 class GeminiChatModel implements SidekickLLM {
   constructor(
@@ -72,7 +86,7 @@ class GeminiChatModel implements SidekickLLM {
   async invoke(messages: BaseMessage[]): Promise<InvocationResult> {
     const payload = {
       model: this.options.model,
-      messages: messages.map(serializeMessage),
+      messages: applySystemDiscipline(messages).map(serializeMessage),
       temperature: this.options.temperature,
       max_tokens: this.options.maxTokens,
     };
@@ -156,6 +170,21 @@ function serializeMessage(message: BaseMessage): InvocationMessage {
   };
 }
 
+function applySystemDiscipline(messages: BaseMessage[]): BaseMessage[] {
+  if (messages.some((message) => resolveRole(message) === "system")) {
+    return messages.map((message) => {
+      if (resolveRole(message) !== "system") return message;
+      const content = `${extractMessageContent(message)}\n\n${OPENCODE_SYSTEM_DISCIPLINE}`;
+      return new SystemMessage(content);
+    });
+  }
+
+  return [
+    new SystemMessage(OPENCODE_SYSTEM_DISCIPLINE),
+    ...messages,
+  ];
+}
+
 function resolveRole(message: BaseMessage): InvocationMessage["role"] {
   const maybeType =
     typeof (message as { getType?: () => string }).getType === "function"
@@ -191,6 +220,8 @@ function extractMessageContent(message: BaseMessage): string {
 }
 
 export function getLLM(options: LLMFactoryOptions): SidekickLLM {
+  if (llmFactoryOverride) return llmFactoryOverride(options);
+
   const { role, withNiaContext = false, temperature } = options;
   const apiKey = process.env.GEMINI_API_KEY;
 
@@ -241,3 +272,11 @@ export const getUIDesignerLLM = () => getLLM({ role: "ui_designer", tier: "max" 
 export const getLegalLLM      = () => getLLM({ role: "legal",       tier: "free" });
 export const getRouterLLM     = () => getLLM({ role: "router",      tier: "free" });
 export const getDecomposerLLM = () => getLLM({ role: "router",      tier: "free", temperature: 0.1 });
+
+export function setLLMFactoryForTests(factory: (options: LLMFactoryOptions) => SidekickLLM): void {
+  llmFactoryOverride = factory;
+}
+
+export function resetLLMFactoryForTests(): void {
+  llmFactoryOverride = null;
+}

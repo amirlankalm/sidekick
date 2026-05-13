@@ -5,6 +5,7 @@
   "main": "dist/server.js",
   "scripts": {
     "build": "tsc",
+    "test": "npm run build && node --test dist/*.test.js",
     "start": "node dist/server.js",
     "serve": "npx ts-node src/server.ts",
     "dev": "npx ts-node src/graph.ts",

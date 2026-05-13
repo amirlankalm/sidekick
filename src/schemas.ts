@@ -39,6 +39,42 @@ export const SourceCodeSchema = z.record(z.string(), z.string());
 
 export type ValidatedSourceCode = z.infer<typeof SourceCodeSchema>;
 
+export const DesignBriefSchema = z.object({
+  designTokens: z.object({
+    colors: z.object({
+      primary: z.string(),
+      background: z.string(),
+      surface: z.string(),
+      text: z.string(),
+    }),
+    borderRadius: z.string(),
+    fontFamily: z.string(),
+    spacingUnit: z.string(),
+  }),
+  componentHierarchy: z.array(
+    z.object({
+      name: z.string(),
+      children: z.array(z.string()),
+    })
+  ),
+  layout: z.enum(["popup", "sidebar", "fullpage"]),
+  iconSet: z.enum(["lucide", "inline-svg"]).default("inline-svg"),
+  responsive: z.boolean(),
+  darkMode: z.enum(["class", "media-query", "none"]),
+});
+
+export const SidekickPlanSchema = z.object({
+  summary: z.string(),
+  steps: z.array(
+    z.object({
+      node: z.string(),
+      description: z.string(),
+      files: z.array(z.string()),
+      estimatedTokens: z.number(),
+    })
+  ),
+});
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
