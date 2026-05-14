@@ -585,6 +585,12 @@ function needsPopupRepair(sourceCode: SourceCode): boolean {
     return true;
   }
 
+  // Detect hero-scale SVG art: any <svg> with explicit width or height > 80px → broken UI
+  if (/<svg[^>]+(?:width|height)=["'](?:[1-9][0-9]{2,}|[89][0-9])["']/i.test(popupHtml)) return true;
+
+  // Detect hero typography: font-size above 24px in popup CSS → banner/splash pattern
+  if (/font-size\s*:\s*(?:[3-9][0-9]|[1-9][0-9]{2,})px/i.test(css)) return true;
+
   return false;
 }
 
