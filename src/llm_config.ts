@@ -45,8 +45,8 @@ export interface AgentTurnResult {
 }
 
 const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai";
-const GEMINI_FLASH_MODEL = process.env.GEMINI_FLASH_MODEL ?? "gemini-2.0-flash-latest";
-const GEMINI_PRO_MODEL   = process.env.GEMINI_PRO_MODEL   ?? "gemini-2.5-pro-latest";
+const GEMINI_FLASH_MODEL = process.env.GEMINI_FLASH_MODEL ?? "gemini-2.5-flash";
+const GEMINI_PRO_MODEL   = process.env.GEMINI_PRO_MODEL   ?? "gemini-2.5-pro";
 
 function resolveModel(tier: SubscriptionTier): string {
   return tier === "max" ? GEMINI_PRO_MODEL : GEMINI_FLASH_MODEL;
