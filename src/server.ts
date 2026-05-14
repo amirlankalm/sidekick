@@ -33,6 +33,12 @@ import type { ExtensyState } from "./state";
 import { bus } from "./bus";
 
 const app = express();
+
+// Trust Vercel's proxy so X-Forwarded-For is used for real client IPs.
+// Without this, express-rate-limit sees 127.0.0.1 for every request and
+// throws ERR_ERL_UNEXPECTED_X_FORWARDED_FOR.
+app.set("trust proxy", 1);
+
 app.use(express.json({ limit: "1mb" }));
 
 // ---------------------------------------------------------------------------
