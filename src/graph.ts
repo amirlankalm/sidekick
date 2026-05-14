@@ -65,7 +65,7 @@ import {
   getArchitectLLM,
   getCoderLLM,
   getLegalLLM,
-  getUIDesignerLLM,
+  getLLM,
   getDecomposerLLM,
   OPENCODE_SYSTEM_DISCIPLINE,
   type ApiMessage,
@@ -1772,7 +1772,7 @@ async function designBriefNode(state: ExtensyState): Promise<Partial<ExtensyStat
 
   if (state.designBrief) return {};
 
-  const llm = getUIDesignerLLM();
+  const llm = getLLM({ role: "ui_designer", tier: state.subscription_tier });
   const response = await llm.invoke([
     new SystemMessage(`You are an elite Chrome Extension product designer.
 Return ONLY JSON matching:
@@ -2213,7 +2213,7 @@ async function uiDesignerNode(
   publishPhase(state, "ui_designer_node", "Polishing extension UI...");
   log.info("Enhancing extension UI/UX design");
 
-  const llm = getUIDesignerLLM();
+  const llm = getLLM({ role: "ui_designer", tier: state.subscription_tier });
 
   const codeSnapshot = Object.entries(state.source_code)
     .filter(([filePath]) => filePath.endsWith(".html") || filePath.endsWith(".css") || filePath.endsWith(".js"))

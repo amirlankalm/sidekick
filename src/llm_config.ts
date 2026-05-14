@@ -157,7 +157,7 @@ class GeminiChatModel implements SidekickLLM {
           ...(this.options.defaultHeaders ?? {}),
         },
         body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(45_000),
+        signal: AbortSignal.timeout(90_000),
       });
 
       const data = (await response.json().catch(() => null)) as
