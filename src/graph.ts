@@ -82,6 +82,8 @@ import {
 } from "./schemas";
 import { bus } from "./bus";
 import { getNiaClient } from "./nia";
+import { fetchContext7Grounding, detectContext7Library, setContext7GroundingForTests, resetContext7GroundingForTests } from "./context7";
+import { EXTENSION_UI_SKILL } from "./extensionUiSkill";
 import { createToolContext, evaluatePermission, type ToolContext } from "./tools/registry";
 import { launchPersistentContext, mkdir, rm, runCommand, writeTextFile } from "./tools/wrappers";
 import { parallelBatch } from "./tools/batch";
@@ -120,6 +122,23 @@ const ALLOWED_DOC_HOSTS = new Set([
   "developers.notion.com",
   "supabase.com",
   "docs.supabase.com",
+  // AI providers
+  "ai.google.dev",
+  "developers.generativeai.google",
+  "docs.anthropic.com",
+  "openai.com",
+  // Google APIs (Maps, YouTube, Calendar, etc.)
+  "developers.google.com",
+  "cloud.google.com",
+  // Common third-party services
+  "api.slack.com",
+  "discord.com",
+  "docs.discord.com",
+  "developer.twitter.com",
+  "developers.facebook.com",
+  "docs.airtable.com",
+  "developers.hubspot.com",
+  "doc.clickup.com",
 ]);
 /** Maps permission names → official Chrome API reference pages (deterministic grounding) */
 const CHROME_API_DOC_URLS: Record<string, string> = {
@@ -184,7 +203,59 @@ function buildNiaQueries(state: ExtensyState): string[] {
     queries.push("Stripe Payment Link publishable key redirect URL chrome.tabs.create billing Chrome extension");
   }
 
-  return queries.slice(0, 5);
+  // 6. Third-party API grounding — detect which external APIs the extension will call
+  // and inject a targeted Nia query so the coder gets real endpoint/auth docs.
+  const featureText = features.map(f => f.summary).join(" ").toLowerCase();
+  const promptText  = (state.user_prompt ?? "").toLowerCase();
+  const combined    = featureText + " " + promptText;
+
+  const apiGrounding = detectThirdPartyApiQuery(combined);
+  if (apiGrounding) queries.push(apiGrounding);
+
+  return queries.slice(0, 6);
+}
+
+/**
+ * Detects the most relevant third-party API from free-text (user prompt + feature summaries)
+ * and returns a targeted Nia search query for that API's authentication and endpoint docs.
+ * Returns null when no third-party API is detected.
+ */
+function detectThirdPartyApiQuery(text: string): string | null {
+  const matchers: Array<[RegExp, string]> = [
+    [/gemini|google.*ai|generative.*language|gemini.*api/,
+      "Google Gemini API JavaScript fetch generateContent endpoint Authorization API key header authentication example"],
+    [/openai|gpt-?4|gpt-?3|chatgpt/,
+      "OpenAI API JavaScript fetch chat completions endpoint Authorization Bearer token header example"],
+    [/anthropic|claude/,
+      "Anthropic Claude API JavaScript fetch messages endpoint x-api-key header authentication example"],
+    [/google maps|maps.*api|geocod/,
+      "Google Maps JavaScript API key restriction fetch geocoding Places API authentication example"],
+    [/youtube.*api|youtube.*data/,
+      "YouTube Data API v3 JavaScript fetch Authorization API key OAuth quota example"],
+    [/google.*calendar|calendar.*api/,
+      "Google Calendar API JavaScript fetch OAuth 2.0 Authorization Bearer token events insert example"],
+    [/slack/,
+      "Slack Web API JavaScript fetch Authorization Bearer OAuth token chat.postMessage example"],
+    [/discord/,
+      "Discord API JavaScript fetch Authorization Bot token headers endpoints example"],
+    [/notion/,
+      "Notion API JavaScript fetch Authorization Bearer integration token pages databases example"],
+    [/airtable/,
+      "Airtable REST API JavaScript fetch Authorization Bearer token base table records example"],
+    [/github.*api|octokit/,
+      "GitHub REST API JavaScript fetch Authorization Bearer token headers repos issues example"],
+    [/twitter|x\.com.*api/,
+      "Twitter X API v2 JavaScript fetch Authorization Bearer OAuth 2.0 tweets example"],
+    [/spotify/,
+      "Spotify Web API JavaScript fetch Authorization Bearer OAuth 2.0 token tracks playlists example"],
+    [/weather|openweather/,
+      "OpenWeatherMap API JavaScript fetch API key query parameter current forecast example"],
+  ];
+
+  for (const [pattern, query] of matchers) {
+    if (pattern.test(text)) return query;
+  }
+  return null;
 }
 
 type ConnectorKind = "supabase" | "stripe";
@@ -1719,26 +1790,45 @@ Return ONLY one URL per line — no prose, no numbering, no markdown fences.`),
 
   log.info("Phase 3 complete", { webContentLength: webContent.length });
 
+  // ── Phase 3.5: Context7 Live API Docs ───────────────────────────────────
+  // Always fetches Chrome Extension MV3 docs (11k snippets, High reputation).
+  // Also fetches third-party API docs when one is detected in the prompt.
+  // Both run in parallel; failures are silent — Nia + web fetch serve as fallback.
+  const combinedText = [state.user_prompt ?? "", ...(state.blueprint?.features ?? []).map(f => f.summary)].join(" ");
+  const permissions = state.blueprint?.permissions ?? [];
+  log.info("Phase 3.5 — context7 docs (Chrome Extension MV3 + detected API)");
+  let context7Docs = "";
+  try {
+    const docs = await fetchContext7Grounding(combinedText, permissions);
+    if (docs.trim()) {
+      context7Docs = docs;
+      log.info("Phase 3.5 complete", { length: docs.length });
+    }
+  } catch (err) {
+    log.warn("Phase 3.5 skipped — context7 unavailable", { error: String(err) });
+  }
+
   // ── Phase 4: Nia Semantic Recall (tier-aware depth) ──────────────────────
   const isMax = state.subscription_tier === "max";
-  log.info(`Phase 4 — Pulling context from Nia (${isMax ? "deep" : "query"} mode)`);
+  log.info(`Phase 4 — Pulling context from Nia (${isMax ? "deep×2+query" : "query×6"} mode)`);
 
   let niaContext = "(Nia unavailable for this run)";
   try {
     const niaClient = getNiaClient();
     const niaQueries = buildNiaQueries(state);
 
-    log.info("Phase 4 — Nia queries", { queries: niaQueries, mode: isMax ? "deep+query" : "query" });
+    log.info("Phase 4 — Nia queries", { queries: niaQueries, mode: isMax ? "deep×2+query" : "query×6" });
 
     let niaResults: string[];
     if (isMax) {
-      // Max tier: searchDeep for the primary (most hallucination-prone) query,
-      // searchQuery for the remaining contextual queries in parallel.
-      const [deepResult, ...restResults] = await Promise.all([
+      // Max tier: searchDeep on the top 2 queries (highest hallucination risk),
+      // searchQuery for the remaining contextual queries — all in parallel.
+      const [deep0, deep1, ...restResults] = await Promise.all([
         niaClient.searchDeep(niaQueries[0]).catch(() => ""),
-        ...niaQueries.slice(1).map((q) => niaClient.searchQuery(q).catch(() => "")),
+        niaQueries[1] ? niaClient.searchDeep(niaQueries[1]).catch(() => "") : Promise.resolve(""),
+        ...niaQueries.slice(2).map((q) => niaClient.searchQuery(q).catch(() => "")),
       ]);
-      niaResults = [deepResult, ...restResults];
+      niaResults = [deep0, deep1, ...restResults];
     } else {
       // Pro tier: searchQuery for all queries — multi-source RAG against indexed docs.
       niaResults = await Promise.all(
@@ -1746,9 +1836,10 @@ Return ONLY one URL per line — no prose, no numbering, no markdown fences.`),
       );
     }
 
-    // Cap each result to 1,800 chars so 5 results stay within ~9,000 chars total
+    // Per-result cap: Max gets more per result (deep results are denser)
+    const perResultCap = isMax ? 2500 : 2000;
     const combined = niaResults
-      .map((r) => r.slice(0, 1800))
+      .map((r) => r.slice(0, perResultCap))
       .filter(Boolean)
       .join("\n\n---\n\n");
 
@@ -1761,12 +1852,13 @@ Return ONLY one URL per line — no prose, no numbering, no markdown fences.`),
 
   // ── Phase 5: Synthesize (Max-tier only) ──────────────────────────────────
   if (state.subscription_tier !== "max") {
-    // Pro tier: prioritise Nia context and web docs, skip full synthesis.
+    // Pro tier: prioritise context7 live docs, then Nia, then web docs.
     // Cap to 6,000 chars so the coder prompt stays within budget.
     const rawContext = [
-      "## Nia API & Design Context\n" + niaContext.slice(0, 3000),
-      "## Web Documentation\n" + webContent.slice(0, 2500),
-    ].join("\n\n---\n\n").slice(0, 6000);
+      context7Docs ? "## Live API Documentation (context7)\n" + context7Docs.slice(0, 2000) : "",
+      "## Nia API & Design Context\n" + niaContext.slice(0, 2500),
+      "## Web Documentation\n" + webContent.slice(0, 1500),
+    ].filter(Boolean).join("\n\n---\n\n").slice(0, 6000);
 
     log.info("Phase 5 skipped (Pro tier) — passing raw context", { contextLength: rawContext.length });
     return { research_context: rawContext };
@@ -1791,6 +1883,7 @@ Structure with these exact sections (keep each section under 800 characters):
 ## Implementation Gotchas`),
     new HumanMessage(
       `## Research Questions\n${researchQuestions}\n\n` +
+      `## Live API Documentation (context7)\n${context7Docs || "(no third-party API detected)"}\n\n` +
       `## Web Documentation Fetched\n${webContent || "(no pages fetched)"}\n\n` +
       `## Nia Design & API Context\n${niaContext}`
     ),
@@ -1865,21 +1958,25 @@ async function designBriefNode(state: ExtensyState): Promise<Partial<ExtensyStat
   const llm = getLLM({ role: "ui_designer", tier: state.subscription_tier });
   const response = await llm.invoke([
     new SystemMessage(`You are an elite Chrome Extension product designer.
-Return ONLY JSON matching:
+
+${EXTENSION_UI_SKILL}
+
+Based on the skill standard above and the user request, choose the right surface (popup/side-panel/overlay) and return ONLY JSON matching:
 {
   "designTokens": {
-    "colors": { "primary": "", "background": "", "surface": "", "text": "" },
+    "colors": { "primary": "", "background": "", "surface": "", "border": "", "text": "", "muted": "", "accent": "", "error": "" },
     "borderRadius": "",
     "fontFamily": "",
     "spacingUnit": ""
   },
-  "componentHierarchy": [{ "name": "PopupRoot", "children": ["Header", "MainContent", "Footer"] }],
+  "componentHierarchy": [{ "name": "PopupRoot", "children": ["Header", "PrimaryActionArea", "ContextStrip", "Footer"] }],
   "layout": "popup",
   "iconSet": "inline-svg",
   "responsive": true,
-  "darkMode": "media-query"
+  "darkMode": "media-query",
+  "requiredStates": ["loading", "empty", "error", "no-api-key", "offline"]
 }
-Use restrained editorial utility styling. Avoid purple-blue AI gradients, emojis, external fonts, and framework-only styling.`),
+Return only the JSON. No prose.`),
     new HumanMessage(
       [
         `User request:\n${state.user_prompt}`,
@@ -1973,6 +2070,9 @@ function buildCoderSystemPrompt(connectors: ConnectorKind[], state: ExtensyState
     "## Chrome Extension Engineering Rules",
     "- Always include manifest.json with manifest_version: 3.",
     "- Always include a browser-action popup: popup.html + popup.css + popup.js. manifest action.default_popup must point to popup.html.",
+    "- CRITICAL: Every file listed in manifest.json MUST be generated. This includes: every JS file in content_scripts[].js, every CSS file in content_scripts[].css, the background.service_worker file, and any options_page or options_ui.page. Declaring a file in the manifest but not generating it will cause the extension to fail to load — this is a fatal error.",
+    "- When the user prompt requires injecting UI into a page (buttons, overlays, cards, badges, highlights), you MUST use a content script. Declare it in manifest.json content_scripts and generate the corresponding content.js (and CSS file if needed). Do NOT rely solely on popup.js for page-level injection.",
+    "- Content scripts that display UI overlays MUST have a companion CSS file. Reference it in manifest.json content_scripts[].css and generate it.",
     "- Extension popups are raw static files. Never use Tailwind, @tailwind, @apply, CDN imports, build-step CSS, external font imports, or framework syntax.",
     "- Write complete, production CSS by hand. Target 360px wide × 480px tall popup. Use real selectors that exist in the HTML.",
     "- Popup must be a polished product surface: clear title, short description, status area, primary action button (id=\"primary-action\"), status element (aria-label=\"Status\"), disabled/error/empty states, accessible labels.",
@@ -1981,7 +2081,7 @@ function buildCoderSystemPrompt(connectors: ConnectorKind[], state: ExtensyState
     "- Service workers must follow MV3 patterns (no persistent background pages).",
     "- All external requests must use host_permissions declared in the manifest.",
     "- Never invent third-party API endpoints, domains, or SDK URLs. External APIs are allowed only when the exact endpoint/domain appears in the user request, connector prompt, or research context.",
-    "- For AI features without an explicitly provided endpoint, implement a local deterministic fallback or a settings UI for user-provided keys.",
+    "- For AI features without an explicitly provided endpoint, implement a settings UI (settings.html + settings.js) where the user can enter their own API key. Store the key in chrome.storage.sync. In the content script or popup, check for the key on action and show a prompt to open settings if missing.",
     designProfileLine,
     connectors.length > 0
       ? "- Wire the provided Extensy connector modules for auth/database/payments. Do not invent raw provider glue."
@@ -2086,22 +2186,48 @@ async function coderNode(state: ExtensyState): Promise<Partial<ExtensyState>> {
     tier: state.subscription_tier,
   });
 
-  // ── Free-tier Nia grounding (inject before the loop, same as before) ───────
+  // ── Free-tier grounding (runs once on first invocation, not on QA retries) ─
+  // Pro/Max already have research_context from researcher_node.
+  // Free tier skips researcher entirely, so we fetch context7 + a quick Nia
+  // web search here to give the coder at least basic grounding.
   const stateParts: string[] = [];
   if (state.subscription_tier === "free" && !state.research_context && !isRetry) {
+    const freeGroundingParts: string[] = [];
+    const freeCombinedText = [
+      state.user_prompt ?? "",
+      ...(state.blueprint?.features ?? []).map((f) => f.summary),
+    ].join(" ");
+    const freePermissions = state.blueprint?.permissions ?? [];
+
+    // context7: Chrome Extension MV3 docs (always) + detected third-party API
     try {
-      const primaryPerm = state.blueprint?.permissions?.[0];
+      const c7docs = await fetchContext7Grounding(freeCombinedText, freePermissions);
+      if (c7docs.trim()) {
+        freeGroundingParts.push(c7docs.slice(0, 2000));
+        log.info("Free-tier context7 grounding injected", { chars: Math.min(c7docs.length, 2000) });
+      }
+    } catch (err) {
+      log.warn("Free-tier context7 grounding skipped", { error: String(err) });
+    }
+
+    // Nia: quick web search for the primary Chrome API
+    try {
+      const primaryPerm = freePermissions[0];
       const niaQuery = primaryPerm
         ? `Chrome Extension MV3 chrome.${primaryPerm} API method signatures parameters code examples`
         : "Chrome Extension MV3 activeTab scripting executeScript API patterns content scripts";
       const niaClient = getNiaClient();
       const webGrounding = await niaClient.searchWeb(niaQuery, 3);
       if (webGrounding.trim()) {
-        stateParts.push(`## Chrome API Quick Reference (Nia)\n${webGrounding.slice(0, 600)}`);
+        freeGroundingParts.push(`## Chrome API Quick Reference (Nia)\n${webGrounding.slice(0, 600)}`);
         log.info("Free-tier Nia grounding injected", { chars: Math.min(webGrounding.length, 600) });
       }
     } catch (err) {
       log.warn("Free-tier Nia grounding skipped", { error: String(err) });
+    }
+
+    if (freeGroundingParts.length > 0) {
+      stateParts.push(freeGroundingParts.join("\n\n---\n\n"));
     }
   }
 
@@ -2311,24 +2437,20 @@ async function uiDesignerNode(
     .join("\n\n");
 
   const systemPrompt = `You are an elite Chrome Extension UI designer.
-Your task is to completely eliminate generic 'vibecoded' UI and apply a highly structured, premium aesthetic based on the provided design profile and research context.
 
-Strict Design Rules:
-1. DESIGN PROFILE: You must strictly apply the "${state.blueprint?.design_profile || 'Editorial Utility'}" design profile.
-2. RESEARCH CONTEXT: Use relevant color codes, spacing, and border radii from the Nia Design Inspiration context below, but translate them into plain CSS. Do not use Tailwind or utility classes.
-3. EDITORIAL UTILITY DIRECTION: Use a warm off-white canvas (light) or deep charcoal canvas (dark), deep ink text, one restrained accent, left-aligned hierarchy, mono metadata labels, and asymmetrical composition. Avoid SaaS dashboard tropes, glow effects, centered hero blocks, and card spam.
-4. COLOR DISCIPLINE — ABSOLUTE BAN: NEVER use #FF00FF, #00FFFF, neon green, electric violet, hot pink, bright indigo (#4B5BFF or similar), cyan (#22D3EE or similar), or any saturated HSL color with lightness above 70% on a dark background. These colors look amateur and AI-generated. Instead use: warm neutrals (copper, stone, parchment), muted earth tones, cool graphite, or a single restrained accent that could appear in editorial print design. The "Editorial Utility" palette is the gold standard: warm off-white canvas, deep ink, one accent (e.g. teal #0f766e, copper #D4A574, sage #6B7E70, slate #4A6572). Adapt the accent to the extension's purpose — security tools get cooler slate-blues, media tools get warmer ambers, productivity tools get warm copper or sage.
-5. NO PURPLE/BLUE AI GRADIENTS: Never produce gradients from purple to blue, violet to pink, cyan to indigo, or any combination that reads as "AI brand aesthetic." A single-color gradient (light to dark of the same hue) is acceptable if subtle.
-6. FOUNDATION: Use system UI font stacks so the popup is self-contained. Use high-quality inline SVGs configured with \`currentColor\`; do not use emojis for icons.
-7. MICRO-INTERACTIONS: Keep motion minimal and tactile with raw CSS transitions and \`:active\` transforms. Do not write framework-only animation tokens.
-8. SPACING: Use a strict 4-point spacing scale and strong whitespace rhythm. Not every section should be boxed.
-9. CHROME EXTENSION CONSTRAINTS: Popup UI must be raw static HTML, CSS, and JS. Never use \`@tailwind\`, \`@apply\`, utility-class soup, CDN imports, external font imports, React/Vue/Svelte syntax, TypeScript-only syntax, or build-step CSS.
-10. FILE BOUNDARY: Edit only existing popup/options/sidepanel/content HTML, CSS, and JS files. Do not return \`manifest.json\`, background workers, connector libraries, package files, or unrelated app files.
-11. STRUCTURED BRIEF: If a design brief is provided, obey its tokens, hierarchy, layout, icon set, responsiveness, and dark-mode strategy exactly.
+${EXTENSION_UI_SKILL}
 
-Return ONLY a JSON object where each key is a relative file path (same as provided) and each value is the strictly formatted stringified file content.
-Example: { "popup.html": "...", "popup.css": "..." }
-Do not remove functionality or data bindings. Only ENHANCE the styles and structure.
+Additional implementation constraints:
+- Design profile: "${state.blueprint?.design_profile || 'Editorial Utility'}"
+- Raw static files only: no Tailwind, @apply, CDN imports, external fonts, React/Vue/Svelte syntax, TypeScript, or build-step CSS
+- System UI font stack — popup must be fully self-contained
+- Inline SVG icons with currentColor. No emoji icons.
+- 4px spacing scale. Minimal CSS transitions + :active transforms only.
+- If a structured design brief is provided, obey its tokens, hierarchy, layout, and dark-mode strategy exactly.
+- FILE BOUNDARY: edit only popup/options/sidepanel/content HTML, CSS, and JS files. Never return manifest.json, background workers, or package files.
+
+Return ONLY a JSON object: { "popup.html": "...", "popup.css": "..." }
+Do not remove functionality or data bindings. ENHANCE styles and structure only.
 Output ONLY the JSON map — no markdown fences, no prose.`;
 
   const userMessageContent = state.research_context
@@ -2450,6 +2572,37 @@ async function verifyNode(state: ExtensyState): Promise<Partial<ExtensyState>> {
       return { verify_error: error, verify_retry_count: state.verify_retry_count + 1 };
     }
   } else {
+    // Manifest completeness check: every file referenced in manifest.json must exist in source_code.
+    const manifestRaw = state.source_code["manifest.json"];
+    if (manifestRaw) {
+      try {
+        const manifest = JSON.parse(manifestRaw) as {
+          content_scripts?: Array<{ js?: string[]; css?: string[] }>;
+          background?: { service_worker?: string };
+          action?: { default_popup?: string };
+          options_page?: string;
+          options_ui?: { page?: string };
+        };
+        const required: string[] = [];
+        for (const cs of manifest.content_scripts ?? []) {
+          required.push(...(cs.js ?? []), ...(cs.css ?? []));
+        }
+        if (manifest.background?.service_worker) required.push(manifest.background.service_worker);
+        if (manifest.action?.default_popup) required.push(manifest.action.default_popup);
+        if (manifest.options_page) required.push(manifest.options_page);
+        if (manifest.options_ui?.page) required.push(manifest.options_ui.page);
+
+        const missing = required.filter((f) => !(f in state.source_code));
+        if (missing.length > 0) {
+          const error = `manifest.json references files that were not generated: ${missing.join(", ")}. Generate every file declared in manifest.json.`;
+          bus.publish({ type: "verify.failed", requestId: state.requestId, error, retryCount: state.verify_retry_count + 1 });
+          return { verify_error: error, verify_retry_count: state.verify_retry_count + 1 };
+        }
+      } catch {
+        // Non-fatal: malformed manifest will be caught by later checks.
+      }
+    }
+
     const jsFiles = Object.keys(state.source_code).filter((filePath) => filePath.endsWith(".js"));
     const results = await parallelBatch(
       ctx,
@@ -2886,11 +3039,20 @@ async function integrationNode(
     .join("\n\n");
 
   const systemPrompt = `You are a senior integration engineer for Chrome Extensions.
-Review the provided source code.  If any third-party APIs are called:
-1. Generate thin, well-typed helper modules (e.g. api/client.js)
-2. Add any missing error-handling wrappers
-3. If auth/database/payments are required, wire the existing Extensy connector modules instead of inventing new provider clients
-4. Return a JSON map of NEW OR MODIFIED files only (same schema as coder_node output)
+Review the provided source code. Apply these rules in order:
+
+1. API KEY DETECTION — If any file reads chrome.storage.sync for an API key (e.g. apiKey, geminiKey, openaiKey) or makes a fetch to a third-party API (OpenAI, Gemini, Slack, GitHub, etc.):
+   a. Generate settings.html — a minimal, well-styled page where the user can paste their API key and click Save.
+   b. Generate settings.js — reads the current key from chrome.storage.sync on load, saves on form submit, shows success/error feedback.
+   c. Add "options_page": "settings.html" to manifest.json if not already present.
+   d. In every content script or popup that uses the key: wrap the API call with a chrome.storage.sync.get check. If the key is missing, surface a clear "Open Settings" prompt instead of silently failing.
+   e. Include a comment in settings.html linking to where the user can obtain the API key (e.g. Google AI Studio for Gemini, platform.openai.com for OpenAI).
+
+2. HELPER MODULES — Generate thin, well-typed helper modules for any third-party API call (e.g. api/gemini.js, api/openai.js) with real endpoint URLs, correct auth headers, and error handling.
+
+3. CONNECTORS — If auth/database/payments are required, wire the existing Extensy connector modules instead of inventing new provider clients.
+
+4. Return a JSON map of NEW OR MODIFIED files only (same schema as coder_node output).
 If no integrations are needed, return an empty JSON object: {}`;
 
   const response = await llm.invoke([
@@ -3148,4 +3310,4 @@ export const __test__ = {
   findUngroundedExternalEndpoints,
 };
 
-export { buildGraph };
+export { buildGraph, setContext7GroundingForTests, resetContext7GroundingForTests };

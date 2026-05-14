@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import path from "path";
 import type { BaseMessage } from "@langchain/core/messages";
 import { bus, type BusEvent } from "./bus";
-import { buildGraph, __test__, setSupabaseClientForTests, resetSupabaseClientForTests, setFetchDocPageForTests, resetFetchDocPageForTests } from "./graph";
+import { buildGraph, __test__, setSupabaseClientForTests, resetSupabaseClientForTests, setFetchDocPageForTests, resetFetchDocPageForTests, setContext7GroundingForTests, resetContext7GroundingForTests } from "./graph";
 import {
   resetLLMFactoryForTests,
   setLLMFactoryForTests,
@@ -123,19 +123,24 @@ function installMockLLM(source: SourceCode = cleanExtension): void {
                 primary: "#0f766e",
                 background: "#f5f5f4",
                 surface: "#ffffff",
+                border: "#e5e5e5",
                 text: "#0f0f0f",
+                muted: "#6b7280",
+                accent: "#0f766e",
+                error: "#dc2626",
               },
-              borderRadius: "8px",
+              borderRadius: "6px",
               fontFamily: "-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif",
               spacingUnit: "4px",
             },
             componentHierarchy: [
-              { name: "PopupRoot", children: ["Header", "MainContent", "Footer"] },
+              { name: "PopupRoot", children: ["Header", "PrimaryActionArea", "ContextStrip", "Footer"] },
             ],
             layout: "popup",
             iconSet: "inline-svg",
             responsive: true,
             darkMode: "media-query",
+            requiredStates: ["loading", "empty", "error", "no-api-key", "offline"],
           }),
         };
       }
@@ -186,6 +191,18 @@ function installMockFetch(): void {
   });
 }
 
+function installMockContext7(): void {
+  setContext7GroundingForTests(async (combinedText: string, permissions: string[]) => {
+    const parts = [
+      `## Chrome Extension MV3 — Live Docs (context7)\n\nchrome.storage.local.set({key: value}, callback). chrome.tabs.query({active: true, currentWindow: true}). Service worker registered via background.service_worker in manifest.json. Content scripts declared via content_scripts[].js. No eval(), no inline scripts (MV3 CSP). Permissions: ${permissions.join(", ")}.`,
+    ];
+    if (/gemini|openai|anthropic/i.test(combinedText)) {
+      parts.push(`## Detected API — Live Docs (context7)\n\nfetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent', {method:'POST', headers:{'Content-Type':'application/json','x-goog-api-key': apiKey}, body: JSON.stringify({contents:[{parts:[{text: prompt}]}]})});`);
+    }
+    return parts.join("\n\n---\n\n");
+  });
+}
+
 function baseState(overrides: Partial<ExtensyState> = {}): ExtensyState {
   return {
     requestId: "test-request",
@@ -224,6 +241,7 @@ test.afterEach(() => {
   resetNiaClientForTests();
   resetSupabaseClientForTests();
   resetFetchDocPageForTests();
+  resetContext7GroundingForTests();
 });
 
 test("bus resolves permission requests", async () => {
@@ -293,10 +311,73 @@ test("architect and design brief nodes produce validated structured outputs", as
   assert.deepEqual(architect.blueprint?.permissions, ["activeTab", "scripting"]);
 
   const design = await __test__.designBriefNode(
-    baseState({ blueprint: architect.blueprint ?? null, research_context: "Nia context" })
+    baseState({ subscription_tier: "pro", blueprint: architect.blueprint ?? null, research_context: "Nia context" })
   );
   assert.equal(design.designBrief?.layout, "popup");
   assert.equal(design.designBrief?.designTokens.colors.primary, "#0f766e");
+});
+
+test("context7 grounding is injected for free tier: mock is called and source_code is produced", async () => {
+  installMockNia();
+  installMockLLM();
+
+  // Track whether fetchContext7Grounding was called and with what args
+  let context7CalledWith: { text: string; permissions: string[] } | null = null;
+  setContext7GroundingForTests(async (combinedText, permissions) => {
+    context7CalledWith = { text: combinedText, permissions };
+    return [
+      "## Chrome Extension MV3 — Live Docs (context7)\n\nchrome.storage.local.set({key: value}).",
+      "## Google Gemini API — Live Docs (context7)\n\nfetch('https://generativelanguage.googleapis.com/v1beta/...').",
+    ].join("\n\n---\n\n");
+  });
+
+  const state = baseState({
+    subscription_tier: "free",
+    user_prompt: "Build a Gmail summarizer using Gemini AI.",
+    blueprint: {
+      name: "Gmail Summarizer",
+      description: "Summarize Gmail threads using Gemini.",
+      permissions: ["storage", "tabs"],
+      host_permissions: ["https://mail.google.com/*"],
+      features: [{ id: "summarize", summary: "Summarize Gmail thread using Gemini API." }],
+      design_profile: "Editorial Utility",
+      connectors: [],
+      raw_requirements: "Summarize Gmail using Gemini.",
+    },
+  });
+
+  const result = await __test__.coderNode(state);
+
+  // context7 must have been called (not skipped)
+  assert.ok(context7CalledWith !== null, "fetchContext7Grounding should be called for free-tier coder");
+  // permissions from the blueprint should be forwarded
+  assert.ok(
+    (context7CalledWith as { permissions: string[] }).permissions.includes("storage"),
+    "context7 should receive the blueprint permissions"
+  );
+  // user prompt should be in the combined text
+  assert.ok(
+    (context7CalledWith as { text: string }).text.includes("Gemini"),
+    "context7 combined text should include user prompt content"
+  );
+  // source_code must still be produced — grounding didn't break code generation
+  assert.ok(Object.keys(result.source_code ?? {}).length > 0, "coder should produce source_code");
+});
+
+test("context7 mock returns third-party API docs when prompt mentions Gemini", async () => {
+  installMockContext7();
+  const { fetchContext7Grounding: fetchGrounding } = await import("./context7");
+  const result = await fetchGrounding("Build a Gmail summarizer using Gemini API", ["storage", "tabs"]);
+  assert.ok(result.includes("Chrome Extension MV3"), "Should always include Chrome Extension docs");
+  assert.ok(result.includes("generativelanguage.googleapis.com"), "Should include Gemini API docs when detected");
+});
+
+test("context7 mock returns only Chrome Extension docs when no third-party API is mentioned", async () => {
+  installMockContext7();
+  const { fetchContext7Grounding: fetchGrounding } = await import("./context7");
+  const result = await fetchGrounding("Build a tab manager extension", ["tabs", "storage"]);
+  assert.ok(result.includes("Chrome Extension MV3"), "Should always include Chrome Extension docs");
+  assert.ok(!result.includes("generativelanguage.googleapis.com"), "Should not include Gemini docs for unrelated prompt");
 });
 
 test("compaction node summarizes oversized development context", async () => {

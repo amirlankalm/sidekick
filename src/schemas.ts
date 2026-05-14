@@ -42,25 +42,32 @@ export type ValidatedSourceCode = z.infer<typeof SourceCodeSchema>;
 export const DesignBriefSchema = z.object({
   designTokens: z.object({
     colors: z.object({
-      primary: z.string(),
+      primary:    z.string(),
       background: z.string(),
-      surface: z.string(),
-      text: z.string(),
+      surface:    z.string(),
+      text:       z.string(),
+      // Optional extended palette — present on Pro/Max, absent on Free
+      border:  z.string().optional(),
+      muted:   z.string().optional(),
+      accent:  z.string().optional(),
+      error:   z.string().optional(),
     }),
     borderRadius: z.string(),
-    fontFamily: z.string(),
-    spacingUnit: z.string(),
+    fontFamily:   z.string(),
+    spacingUnit:  z.string(),
   }),
   componentHierarchy: z.array(
     z.object({
-      name: z.string(),
+      name:     z.string(),
       children: z.array(z.string()),
     })
   ),
-  layout: z.enum(["popup", "sidebar", "fullpage"]),
-  iconSet: z.enum(["lucide", "inline-svg"]).default("inline-svg"),
+  layout:   z.enum(["popup", "sidebar", "side-panel", "fullpage"]),
+  iconSet:  z.enum(["lucide", "inline-svg"]).default("inline-svg"),
   responsive: z.boolean(),
-  darkMode: z.enum(["class", "media-query", "none"]),
+  darkMode:   z.enum(["class", "media-query", "none"]),
+  // Which UI states must be implemented — validated by ui_designer_node
+  requiredStates: z.array(z.string()).optional(),
 });
 
 export const SidekickPlanSchema = z.object({
