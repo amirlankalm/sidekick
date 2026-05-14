@@ -99,7 +99,7 @@ const MAX_QA_RETRIES = 3;
  * Free tier gets fewer steps (cost control); Max tier gets more for complex builds.
  */
 const MAX_AGENT_STEPS: Record<string, number> = {
-  free: 3,
+  free: 2,
   pro: 6,
   max: 9,
 };
@@ -367,13 +367,98 @@ function buildEndpointGroundingText(state: ExtensyState): string {
     .join("\n");
 }
 
+// Domains that Chrome extensions legitimately reference without being user-supplied URLs.
+// Prevents false-positive "ungrounded endpoint" rejections on standard infrastructure.
+const EXTENSION_SAFE_HOSTS = new Set([
+  // Google / Chrome infrastructure
+  "fonts.googleapis.com",
+  "fonts.gstatic.com",
+  "chrome.google.com",
+  "www.googleapis.com",
+  "apis.google.com",
+  "accounts.google.com",
+  "ssl.gstatic.com",
+  // CDNs used in extension popups
+  "cdn.jsdelivr.net",
+  "unpkg.com",
+  "cdnjs.cloudflare.com",
+  // Public ad/tracker blocklists for declarativeNetRequest extensions
+  "raw.githubusercontent.com",
+  "easylist.to",
+  "pgl.yoyo.org",
+  "malware-filter.gitlab.io",
+  "ublockorigin.github.io",
+  "filters.adtidy.org",
+  "hostfiles.frogeye.fr",
+  // Common extension update / reporting infra
+  "update.googleapis.com",
+  "clients2.google.com",
+]);
+
+// Map well-known service names to their canonical domains so user prompts
+// like "block YouTube ads" allow youtube.com URLs without needing literal URLs.
+const KEYWORD_TO_HOSTS: Array<[RegExp, string[]]> = [
+  [/youtube/i, ["youtube.com", "www.youtube.com", "youtu.be", "yt3.ggpht.com"]],
+  [/github/i, ["github.com", "api.github.com", "raw.githubusercontent.com", "gist.github.com"]],
+  [/twitter|x\.com/i, ["twitter.com", "x.com", "api.twitter.com", "t.co"]],
+  [/reddit/i, ["reddit.com", "www.reddit.com", "oauth.reddit.com", "i.redd.it"]],
+  [/gmail|google mail/i, ["gmail.com", "mail.google.com"]],
+  [/google/i, ["google.com", "www.google.com", "apis.google.com", "www.gstatic.com"]],
+  [/linkedin/i, ["linkedin.com", "www.linkedin.com"]],
+  [/amazon|aws/i, ["amazon.com", "www.amazon.com", "aws.amazon.com"]],
+  [/shopify/i, ["shopify.com", "api.shopify.com"]],
+  [/slack/i, ["slack.com", "api.slack.com", "files.slack.com"]],
+  [/notion/i, ["notion.so", "api.notion.com"]],
+  [/openai|chatgpt/i, ["api.openai.com", "openai.com"]],
+  [/anthropic|claude/i, ["api.anthropic.com", "anthropic.com"]],
+  [/stripe/i, ["stripe.com", "api.stripe.com", "js.stripe.com"]],
+  [/paypal/i, ["paypal.com", "api.paypal.com"]],
+  [/spotify/i, ["spotify.com", "api.spotify.com"]],
+  [/netflix/i, ["netflix.com", "www.netflix.com"]],
+  [/trello/i, ["trello.com", "api.trello.com"]],
+  [/jira|atlassian/i, ["jira.com", "api.atlassian.com", "atlassian.com"]],
+  [/figma/i, ["figma.com", "api.figma.com"]],
+  [/instagram/i, ["instagram.com", "www.instagram.com", "graph.instagram.com"]],
+  [/facebook/i, ["facebook.com", "www.facebook.com", "graph.facebook.com"]],
+  [/tiktok/i, ["tiktok.com", "www.tiktok.com"]],
+  [/discord/i, ["discord.com", "discord.gg", "discordapp.com"]],
+  [/gmail|google workspace/i, ["mail.google.com", "gmail.com"]],
+  [/drive|google drive/i, ["drive.google.com"]],
+  [/docs|google docs/i, ["docs.google.com"]],
+  [/sheets|google sheets/i, ["sheets.google.com"]],
+  [/calendar|google calendar/i, ["calendar.google.com"]],
+  [/maps|google maps/i, ["maps.google.com", "maps.googleapis.com"]],
+];
+
+function extractImpliedTargetHosts(prompt: string): Set<string> {
+  const hosts = new Set<string>();
+  for (const [pattern, domains] of KEYWORD_TO_HOSTS) {
+    if (pattern.test(prompt)) {
+      for (const d of domains) hosts.add(d);
+    }
+  }
+  return hosts;
+}
+
 function findUngroundedExternalEndpoints(
   sourceCode: SourceCode,
   state: ExtensyState
 ): string[] {
-  const generatedText = Object.values(sourceCode).join("\n");
+  // manifest.json entries (content_scripts.matches, host_permissions) are browser
+  // permission declarations — not runtime API calls. Exclude them from the check.
+  const codeText = Object.entries(sourceCode)
+    .filter(([filename]) => filename !== "manifest.json")
+    .map(([, content]) => content)
+    .join("\n");
+
   const groundingHosts = extractHttpsHosts(buildEndpointGroundingText(state));
-  const generatedUrls = generatedText.match(/https:\/\/[a-z0-9.-]+(?::\d+)?(?:\/[^\s"'`<>)\\]*)?/gi) ?? [];
+
+  // Enrich grounding with service domains implied by the user's plain-text prompt
+  for (const host of extractImpliedTargetHosts(state.user_prompt)) {
+    groundingHosts.add(host);
+  }
+
+  const generatedUrls = codeText.match(/https:\/\/[a-z0-9.-]+(?::\d+)?(?:\/[^\s"'`<>)\\]*)?/gi) ?? [];
   const ungrounded = new Set<string>();
 
   for (const rawUrl of generatedUrls) {
@@ -381,7 +466,10 @@ function findUngroundedExternalEndpoints(
       const url = new URL(rawUrl);
       const host = url.hostname.toLowerCase();
       if (host === "localhost" || host === "127.0.0.1" || host.endsWith(".local")) continue;
+      if (EXTENSION_SAFE_HOSTS.has(host)) continue;
       if (groundingHosts.has(host)) continue;
+      // Allow subdomains of grounded hosts (api.youtube.com when youtube.com is grounded)
+      if ([...groundingHosts].some((g) => host === g || host.endsWith("." + g))) continue;
       ungrounded.add(rawUrl);
     } catch {
       // Ignore malformed URL-like strings.
@@ -1770,7 +1858,9 @@ async function designBriefNode(state: ExtensyState): Promise<Partial<ExtensyStat
   const log = logger.child({ node: "design_brief_node", requestId: state.requestId });
   publishPhase(state, "design_brief_node", "Creating structured design brief...");
 
-  if (state.designBrief) return {};
+  // Free tier skips the design brief to reduce latency — coder system prompt already
+  // carries the design profile from the blueprint.
+  if (state.designBrief || state.subscription_tier === "free") return {};
 
   const llm = getLLM({ role: "ui_designer", tier: state.subscription_tier });
   const response = await llm.invoke([
