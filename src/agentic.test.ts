@@ -3,13 +3,17 @@ import assert from "node:assert/strict";
 import path from "path";
 import type { BaseMessage } from "@langchain/core/messages";
 import { bus, type BusEvent } from "./bus";
-import { buildGraph, __test__ } from "./graph";
+import { buildGraph, __test__, setSupabaseClientForTests, resetSupabaseClientForTests, setFetchDocPageForTests, resetFetchDocPageForTests } from "./graph";
 import {
   resetLLMFactoryForTests,
   setLLMFactoryForTests,
   type LLMFactoryOptions,
   type SidekickLLM,
+  type ApiMessage,
+  type AgentTurnResult,
+  type ToolDefinition,
 } from "./llm_config";
+import { setNiaClientForTests, resetNiaClientForTests } from "./nia";
 import {
   createToolContext,
   evaluatePermission,
@@ -44,6 +48,16 @@ function messageText(message: BaseMessage): string {
   return typeof message.content === "string" ? message.content : JSON.stringify(message.content);
 }
 
+function makeMockInvokeWithTools(
+  source: SourceCode
+): (messages: ApiMessage[], _tools: ToolDefinition[]) => Promise<AgentTurnResult> {
+  return async (_messages: ApiMessage[], _tools: ToolDefinition[]): Promise<AgentTurnResult> => ({
+    content: JSON.stringify(source),
+    rawToolCalls: [],
+    finishReason: "stop",
+  });
+}
+
 function installMockLLM(source: SourceCode = cleanExtension): void {
   setLLMFactoryForTests((options: LLMFactoryOptions): SidekickLLM => ({
     async invoke(messages: BaseMessage[]) {
@@ -76,6 +90,11 @@ function installMockLLM(source: SourceCode = cleanExtension): void {
       }
 
       if (options.role === "architect") {
+        if (prompt.includes("Nia Design & API Context") || prompt.includes("Synthesize the provided")) {
+          return {
+            content: "## Chrome API Patterns\nUse chrome.scripting for injection.\n\n## Nia context\nEditorial Utility tokens: --bg:#f5f5f4; --ink:#0f0f0f; --accent:#0f766e;",
+          };
+        }
         return {
           content: JSON.stringify({
             name: "Focus Clipper",
@@ -129,10 +148,42 @@ function installMockLLM(source: SourceCode = cleanExtension): void {
       if (options.role === "router") {
         return { content: "1. Which MV3 permissions are required?\n2. Which popup files are needed?" };
       }
-      if (options.role === "researcher") return { content: "Nia context: local-only MV3 patterns." };
       return { content: JSON.stringify(source) };
     },
+
+    invokeWithTools: makeMockInvokeWithTools(source),
   }));
+}
+
+function installMockNia(): void {
+  setNiaClientForTests(() => ({
+    async searchWeb(query: string): Promise<string> {
+      return `**Chrome MV3 Web Grounding** (${query.slice(0, 40)}): chrome.scripting.executeScript injects content scripts. chrome.storage.local.set/get for persistence.`;
+    },
+    async searchQuery(query: string): Promise<string> {
+      return `Nia query context: ${query.slice(0, 60)}. Chrome MV3: use chrome.scripting for injection, chrome.storage.local for persistence. Editorial Utility tokens: --bg:#f5f5f4; --ink:#0f0f0f; --accent:#0f766e;`;
+    },
+    async searchDeep(query: string): Promise<string> {
+      return `Nia deep research: ${query.slice(0, 60)}. Authoritative Chrome Extension MV3 patterns — chrome.scripting.executeScript({target:{tabId},func}), chrome.storage.local.set({key:value}), service worker via background.service_worker in manifest. No eval(), no inline scripts per CSP.`;
+    },
+  }));
+}
+
+function installMockSupabase(): void {
+  setSupabaseClientForTests(() => ({
+    storage: {
+      from: (_bucket: string) => ({
+        upload: async () => ({ error: new Error("test-mock: no Supabase bucket"), data: null }),
+        getPublicUrl: (_path: string) => ({ data: { publicUrl: "" } }),
+      }),
+    },
+  }));
+}
+
+function installMockFetch(): void {
+  setFetchDocPageForTests(async (url: string) => {
+    return `--- Source: ${url} ---\nMocked doc: MV3 service workers, chrome.scripting API, declarative content rules.`;
+  });
 }
 
 function baseState(overrides: Partial<ExtensyState> = {}): ExtensyState {
@@ -170,6 +221,9 @@ function baseState(overrides: Partial<ExtensyState> = {}): ExtensyState {
 
 test.afterEach(() => {
   resetLLMFactoryForTests();
+  resetNiaClientForTests();
+  resetSupabaseClientForTests();
+  resetFetchDocPageForTests();
 });
 
 test("bus resolves permission requests", async () => {
@@ -288,6 +342,10 @@ test("free-tier graph completes end-to-end and emits granular pipeline events", 
 
 test("remaining pipeline nodes return sane partial state without live services", async () => {
   installMockLLM();
+  installMockNia();
+  installMockSupabase();
+  installMockFetch();
+
   const blueprint = {
     name: "Focus Clipper",
     description: "Clip useful text from the current tab.",
@@ -372,4 +430,336 @@ test("verify node skips shell execution for free tier", async () => {
     })
   );
   assert.equal(result.verify_error, "");
+});
+
+test("verify node runs node --check for pro tier and passes valid JS", async () => {
+  const events: BusEvent[] = [];
+  const unsubscribe = bus.subscribeAll((event) => {
+    if (event.type === "permission.requested") bus.resolvePermission(event.id, "allow");
+    events.push(event);
+  });
+
+  try {
+    const result = await __test__.verifyNode(
+      baseState({
+        subscription_tier: "pro",
+        source_code: {
+          "popup.js": "document.addEventListener('DOMContentLoaded', function() { var x = 1; });",
+          "manifest.json": JSON.stringify({ manifest_version: 3, name: "T", version: "1.0" }),
+        },
+      })
+    );
+    assert.equal(result.verify_error, "");
+    assert.ok(!events.some((e) => e.type === "verify.skipped"), "verify.skipped must NOT fire for pro tier");
+  } finally {
+    unsubscribe();
+  }
+});
+
+test("verify node catches syntax errors in JS for pro tier", async () => {
+  const unsubscribe = bus.subscribeAll((event) => {
+    if (event.type === "permission.requested") bus.resolvePermission(event.id, "allow");
+  });
+
+  try {
+    const result = await __test__.verifyNode(
+      baseState({
+        subscription_tier: "pro",
+        source_code: {
+          "popup.js": "function broken( { console.log('unclosed'); }",
+        },
+      })
+    );
+    assert.ok((result.verify_error ?? "").length > 0, "verify_error should be set for invalid JS");
+  } finally {
+    unsubscribe();
+  }
+});
+
+test("qa_router proceeds to fan_out after max retries exhausted", () => {
+  const exhaustedState = baseState({
+    qa_retry_count: 3,
+    qa_logs: [
+      {
+        type: "pageerror",
+        level: "error",
+        message: "Uncaught ReferenceError: foo is not defined",
+        captured_at: new Date().toISOString(),
+      },
+    ],
+  });
+
+  const route = __test__.qaRouterFn(exhaustedState);
+  assert.equal(route, "fan_out_router");
+});
+
+test("qa_router retries coder when errors remain and budget is available", () => {
+  const retryableState = baseState({
+    qa_retry_count: 1,
+    qa_logs: [
+      {
+        type: "console",
+        level: "error",
+        message: "TypeError: Cannot read properties of null",
+        captured_at: new Date().toISOString(),
+      },
+    ],
+  });
+
+  const route = __test__.qaRouterFn(retryableState);
+  assert.equal(route, "compaction_node");
+});
+
+// ---------------------------------------------------------------------------
+// Agentic coder loop tests (OpenCode-style)
+// ---------------------------------------------------------------------------
+
+test("agentic coder loop: tool-calling path builds workspace incrementally", async () => {
+  let step = 0;
+
+  setLLMFactoryForTests((_options: LLMFactoryOptions): SidekickLLM => ({
+    async invoke() {
+      return { content: "{}" };
+    },
+    async invokeWithTools(_messages: ApiMessage[], tools: ToolDefinition[]): Promise<AgentTurnResult> {
+      step++;
+
+      // Step 1: write manifest.json and popup.html via tool calls
+      if (step === 1 && tools.length > 0) {
+        return {
+          content: null,
+          finishReason: "tool_calls",
+          rawToolCalls: [
+            {
+              id: "call_manifest",
+              type: "function",
+              function: {
+                name: "write_file",
+                arguments: JSON.stringify({
+                  path: "manifest.json",
+                  content: JSON.stringify({
+                    manifest_version: 3,
+                    name: "Focus Clipper",
+                    version: "1.0.0",
+                    description: "Clip text from the current tab.",
+                    permissions: ["activeTab", "scripting"],
+                    action: { default_popup: "popup.html" },
+                  }, null, 2),
+                }),
+              },
+            },
+            {
+              id: "call_popup_html",
+              type: "function",
+              function: {
+                name: "write_file",
+                arguments: JSON.stringify({
+                  path: "popup.html",
+                  content: `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8" /><title>Focus Clipper</title><link rel="stylesheet" href="popup.css" /></head><body><main class="shell" data-extensy-polished="true"><section aria-label="Status"><strong id="runtime-status">Active</strong></section><footer><button id="primary-action" type="button"><span>Run</span></button></footer></main><script src="popup.js"></script></body></html>`,
+                }),
+              },
+            },
+          ],
+        };
+      }
+
+      // Step 2: write popup.css and popup.js via tool calls
+      if (step === 2 && tools.length > 0) {
+        return {
+          content: null,
+          finishReason: "tool_calls",
+          rawToolCalls: [
+            {
+              id: "call_css",
+              type: "function",
+              function: {
+                name: "write_file",
+                arguments: JSON.stringify({
+                  path: "popup.css",
+                  content: `:root { --surface: #fff; --bg: #f5f5f4; --ink: #0f0f0f; } html, body { min-height: 480px; } button { width: 100%; } .shell { min-height: 480px; } --primary: #0f766e; transition: opacity 100ms ease;`,
+                }),
+              },
+            },
+            {
+              id: "call_js",
+              type: "function",
+              function: {
+                name: "write_file",
+                arguments: JSON.stringify({
+                  path: "popup.js",
+                  content: `document.addEventListener("DOMContentLoaded", () => { document.getElementById("primary-action")?.addEventListener("click", async () => { const [tab] = await chrome.tabs.query({ active: true, currentWindow: true }); }); });`,
+                }),
+              },
+            },
+          ],
+        };
+      }
+
+      // Final step: text output (done signal)
+      return {
+        content: "All extension files written. Workspace complete.",
+        rawToolCalls: [],
+        finishReason: "stop",
+      };
+    },
+  }));
+
+  const result = await __test__.coderNode(baseState({ subscription_tier: "max" }));
+
+  assert.equal(result.error, undefined, `Unexpected error: ${result.error}`);
+  assert.ok(result.source_code?.["manifest.json"], "manifest.json must be in workspace");
+  assert.ok(result.source_code?.["popup.html"], "popup.html must be in workspace");
+  assert.ok(result.source_code?.["popup.css"], "popup.css must be in workspace");
+  assert.ok(result.source_code?.["popup.js"], "popup.js must be in workspace");
+  assert.match(result.source_code?.["popup.html"] ?? "", /data-extensy-polished="true"/);
+});
+
+test("agentic coder loop: edit_file tool repairs a file in the workspace", async () => {
+  let step = 0;
+
+  const initialSource: SourceCode = {
+    ...cleanExtension,
+    "popup.js": `document.addEventListener("DOMContentLoaded", () => { var broken_syntax_here });`,
+  };
+
+  setLLMFactoryForTests((_options: LLMFactoryOptions): SidekickLLM => ({
+    async invoke() { return { content: "{}" }; },
+    async invokeWithTools(_messages: ApiMessage[], tools: ToolDefinition[]): Promise<AgentTurnResult> {
+      step++;
+      if (step === 1 && tools.length > 0) {
+        return {
+          content: null,
+          finishReason: "tool_calls",
+          rawToolCalls: [{
+            id: "call_edit",
+            type: "function",
+            function: {
+              name: "edit_file",
+              arguments: JSON.stringify({
+                path: "popup.js",
+                old_string: "var broken_syntax_here",
+                new_string: "const status = document.getElementById('runtime-status')",
+              }),
+            },
+          }],
+        };
+      }
+      return { content: "Fix applied.", rawToolCalls: [], finishReason: "stop" };
+    },
+  }));
+
+  const state = baseState({
+    subscription_tier: "pro",
+    source_code: initialSource,
+    qa_logs: [{
+      type: "pageerror",
+      level: "error",
+      message: "SyntaxError: Unexpected identifier",
+      captured_at: new Date().toISOString(),
+    }],
+  });
+
+  const result = await __test__.coderNode(state);
+  assert.equal(result.error, undefined);
+  assert.match(result.source_code?.["popup.js"] ?? "", /const status/);
+  assert.doesNotMatch(result.source_code?.["popup.js"] ?? "", /broken_syntax_here/);
+});
+
+test("agentic coder loop: list_files and read_file tools return correct workspace state", async () => {
+  let callCount = 0;
+  const capturedToolResults: string[] = [];
+
+  setLLMFactoryForTests((_options: LLMFactoryOptions): SidekickLLM => ({
+    async invoke() { return { content: JSON.stringify(cleanExtension) }; },
+    async invokeWithTools(messages: ApiMessage[], tools: ToolDefinition[]): Promise<AgentTurnResult> {
+      callCount++;
+
+      if (callCount === 1 && tools.length > 0) {
+        return {
+          content: null,
+          finishReason: "tool_calls",
+          rawToolCalls: [
+            { id: "list1", type: "function", function: { name: "list_files", arguments: "{}" } },
+            { id: "write1", type: "function", function: { name: "write_file", arguments: JSON.stringify({ path: "popup.html", content: cleanExtension["popup.html"] }) } },
+          ],
+        };
+      }
+
+      if (callCount === 2 && tools.length > 0) {
+        // Capture what the tool results look like in the messages
+        const toolMessages = messages.filter((m): m is Extract<ApiMessage, { role: "tool" }> => m.role === "tool");
+        capturedToolResults.push(...toolMessages.map((m) => m.content));
+
+        return {
+          content: null,
+          finishReason: "tool_calls",
+          rawToolCalls: [
+            { id: "read1", type: "function", function: { name: "read_file", arguments: JSON.stringify({ path: "popup.html" }) } },
+          ],
+        };
+      }
+
+      return { content: "Done.", rawToolCalls: [], finishReason: "stop" };
+    },
+  }));
+
+  await __test__.coderNode(baseState({ subscription_tier: "pro" }));
+
+  assert.ok(callCount >= 2, "LLM must be called multiple times");
+  // The list_files result should appear in later messages
+  assert.ok(capturedToolResults.some((r) => r.includes("popup.html") || r === "(workspace is empty)"),
+    "Tool results must reflect workspace state");
+});
+
+test("agentic coder loop: max steps safety — exits gracefully when loop runs out", async () => {
+  setLLMFactoryForTests((_options: LLMFactoryOptions): SidekickLLM => ({
+    async invoke() { return { content: JSON.stringify(cleanExtension) }; },
+    async invokeWithTools(_messages: ApiMessage[], tools: ToolDefinition[]): Promise<AgentTurnResult> {
+      if (tools.length > 0) {
+        // Always return a tool call → force loop to exhaust
+        return {
+          content: null,
+          finishReason: "tool_calls",
+          rawToolCalls: [{
+            id: "perpetual",
+            type: "function",
+            function: {
+              name: "write_file",
+              arguments: JSON.stringify({ path: "manifest.json", content: JSON.stringify({ manifest_version: 3, name: "T", version: "1.0", permissions: [], action: { default_popup: "popup.html" } }) }),
+            },
+          }],
+        };
+      }
+      // Last step (no tools): return JSON fallback
+      return { content: JSON.stringify(cleanExtension), rawToolCalls: [], finishReason: "stop" };
+    },
+  }));
+
+  // Free tier has 3 max steps — should not infinite loop
+  const result = await __test__.coderNode(baseState({ subscription_tier: "free" }));
+  // Either workspace has files (from write_file calls) or the JSON fallback was parsed
+  assert.equal(result.error, undefined, `Should not error: ${result.error}`);
+  assert.ok(Object.keys(result.source_code ?? {}).length > 0, "Must produce source files");
+});
+
+test("researcher node uses Nia context in synthesized research brief", async () => {
+  installMockLLM();
+  installMockNia();
+  installMockFetch();
+
+  const blueprint = {
+    name: "Focus Clipper",
+    description: "Clip useful text from the current tab.",
+    permissions: ["activeTab", "scripting"],
+    host_permissions: [],
+    features: [{ id: "clip", summary: "Clip selected text locally." }],
+    raw_requirements: "Build a local-only clipping extension.",
+  };
+
+  const result = await __test__.researcherNode(
+    baseState({ subscription_tier: "max", blueprint })
+  );
+
+  assert.ok((result.research_context ?? "").length > 0, "research_context must be populated");
+  assert.match(result.research_context ?? "", /Nia context/, "research_context must contain Nia data");
 });

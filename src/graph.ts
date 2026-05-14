@@ -64,11 +64,13 @@ import {
 import {
   getArchitectLLM,
   getCoderLLM,
-  getResearcherLLM,
   getLegalLLM,
   getUIDesignerLLM,
   getDecomposerLLM,
+  OPENCODE_SYSTEM_DISCIPLINE,
+  type ApiMessage,
 } from "./llm_config";
+import { CODER_TOOLS, executeAgentTool } from "./tools/agentic_tools";
 import { runDevToolsDiagnostics } from "./devtools_mcp";
 import { logger } from "./logger";
 import {
@@ -79,6 +81,7 @@ import {
   validateSchema,
 } from "./schemas";
 import { bus } from "./bus";
+import { getNiaClient } from "./nia";
 import { createToolContext, evaluatePermission, type ToolContext } from "./tools/registry";
 import { launchPersistentContext, mkdir, rm, runCommand, writeTextFile } from "./tools/wrappers";
 import { parallelBatch } from "./tools/batch";
@@ -89,6 +92,17 @@ import { parallelBatch } from "./tools/batch";
 
 /** Max number of QA→coder retry cycles before aborting (prevents inf. loops) */
 const MAX_QA_RETRIES = 3;
+
+/**
+ * Max agentic loop steps inside coder_node per subscription tier.
+ * OpenCode reference: agent.steps field in agent definitions.
+ * Free tier gets fewer steps (cost control); Max tier gets more for complex builds.
+ */
+const MAX_AGENT_STEPS: Record<string, number> = {
+  free: 3,
+  pro: 6,
+  max: 9,
+};
 
 /** Directory where Playwright loads the extension under test */
 const TMP_EXT_DIR = path.join(os.tmpdir(), "sidekick", "extension");
@@ -107,6 +121,72 @@ const ALLOWED_DOC_HOSTS = new Set([
   "supabase.com",
   "docs.supabase.com",
 ]);
+/** Maps permission names → official Chrome API reference pages (deterministic grounding) */
+const CHROME_API_DOC_URLS: Record<string, string> = {
+  scripting:    "https://developer.chrome.com/docs/extensions/reference/api/scripting",
+  storage:      "https://developer.chrome.com/docs/extensions/reference/api/storage",
+  tabs:         "https://developer.chrome.com/docs/extensions/reference/api/tabs",
+  activeTab:    "https://developer.chrome.com/docs/extensions/develop/concepts/activeTab",
+  notifications:"https://developer.chrome.com/docs/extensions/reference/api/notifications",
+  alarms:       "https://developer.chrome.com/docs/extensions/reference/api/alarms",
+  contextMenus: "https://developer.chrome.com/docs/extensions/reference/api/contextMenus",
+  identity:     "https://developer.chrome.com/docs/extensions/reference/api/identity",
+  cookies:      "https://developer.chrome.com/docs/extensions/reference/api/cookies",
+  downloads:    "https://developer.chrome.com/docs/extensions/reference/api/downloads",
+  history:      "https://developer.chrome.com/docs/extensions/reference/api/history",
+  bookmarks:    "https://developer.chrome.com/docs/extensions/reference/api/bookmarks",
+};
+
+/**
+ * Builds targeted Nia search queries from the blueprint.
+ * Queries are designed to retrieve grounding context that prevents the coder
+ * from hallucinating API signatures, endpoint URLs, or CSP-breaking patterns.
+ */
+function buildNiaQueries(state: ExtensyState): string[] {
+  const blueprint = state.blueprint;
+  const permissions = blueprint?.permissions ?? [];
+  const features    = blueprint?.features    ?? [];
+  const connectors  = blueprint?.connectors  ?? [];
+  const profile     = blueprint?.design_profile ?? "Editorial Utility";
+
+  const queries: string[] = [];
+
+  // 1. Chrome API method signatures — top hallucination source
+  const primaryPerm = permissions[0];
+  queries.push(
+    primaryPerm
+      ? `Chrome Extension MV3 chrome.${primaryPerm} exact method signatures parameters return types code example`
+      : "Chrome Extension MV3 activeTab scripting executeScript API exact signatures content scripts"
+  );
+
+  // 2. MV3 CSP constraints — prevents inline-script / eval / remote-code hallucinations
+  queries.push(
+    "Chrome Extension Manifest V3 content security policy no inline scripts no eval service worker background removed declarativeNetRequest"
+  );
+
+  // 3. Design tokens for the specific profile — grounds the UI designer
+  queries.push(
+    `${profile} CSS design tokens hex color palette spacing 4px scale popup 360px system font stack minimal editorial`
+  );
+
+  // 4. Feature-level grounding
+  if (features.length > 0) {
+    queries.push(
+      features.slice(0, 2).map(f => f.summary.slice(0, 100)).join(" | ") +
+      " Chrome Extension MV3 implementation pattern"
+    );
+  }
+
+  // 5. Connector-specific grounding
+  if (connectors.includes("supabase")) {
+    queries.push("Supabase REST API Authorization Bearer apikey header fetch auth signIn select insert Chrome extension");
+  } else if (connectors.includes("stripe")) {
+    queries.push("Stripe Payment Link publishable key redirect URL chrome.tabs.create billing Chrome extension");
+  }
+
+  return queries.slice(0, 5);
+}
+
 type ConnectorKind = "supabase" | "stripe";
 type LegalDocKind = "terms-of-service" | "privacy-policy";
 
@@ -114,7 +194,11 @@ type LegalDocKind = "terms-of-service" | "privacy-policy";
 // Supabase client (used by legal_node to persist the TOS document)
 // ---------------------------------------------------------------------------
 
+type SupabaseOverrideFn = (() => unknown) | null;
+let supabaseClientOverride: SupabaseOverrideFn = null;
+
 function getSupabaseClient() {
+  if (supabaseClientOverride) return supabaseClientOverride() as ReturnType<typeof createClient>;
   const url = process.env.SUPABASE_URL;
   const key = process.env.SUPABASE_ANON_KEY;
   if (!url || !key) {
@@ -123,6 +207,14 @@ function getSupabaseClient() {
     );
   }
   return createClient(url, key);
+}
+
+export function setSupabaseClientForTests(factory: () => unknown): void {
+  supabaseClientOverride = factory;
+}
+
+export function resetSupabaseClientForTests(): void {
+  supabaseClientOverride = null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1373,12 +1465,24 @@ function researchRouterFn(
 // Helper: fetch and strip a documentation web page to plain text
 // ---------------------------------------------------------------------------
 
+type FetchDocPageFn = (url: string, maxChars?: number) => Promise<string>;
+let fetchDocPageOverrideFn: FetchDocPageFn | null = null;
+
+export function setFetchDocPageForTests(fn: FetchDocPageFn): void {
+  fetchDocPageOverrideFn = fn;
+}
+
+export function resetFetchDocPageForTests(): void {
+  fetchDocPageOverrideFn = null;
+}
+
 /**
  * Fetches a public URL, strips all HTML/script/style tags, collapses whitespace,
  * and truncates to `maxChars` to avoid blowing the context window.
  * Uses AbortSignal.timeout so it never hangs the pipeline.
  */
-async function fetchDocPage(url: string, maxChars = 12000): Promise<string> {
+async function fetchDocPage(url: string, maxChars = 3500): Promise<string> {
+  if (fetchDocPageOverrideFn) return fetchDocPageOverrideFn(url, maxChars);
   try {
     const parsedUrl = new URL(url);
     if (parsedUrl.protocol !== "https:" || !ALLOWED_DOC_HOSTS.has(parsedUrl.hostname)) {
@@ -1450,11 +1554,16 @@ async function researcherNode(
   log.info("Phase 1 — Decomposing into research questions");
 
   const p1Response = await decomposerLLM.invoke([
-    new SystemMessage(`You are a Chrome Extension research planner.
-Given a blueprint, output a NUMBERED LIST (1-5 items, plain text) of the most specific, targeted research questions that need to be answered to implement this extension correctly.
-Focus on: Chrome MV3 APIs, third-party API endpoints, auth flows, and CSP constraints.
+    new SystemMessage(`You are a Chrome Extension hallucination-prevention researcher.
+Given a blueprint, output a NUMBERED LIST of 3-5 PRECISE questions whose answers (from official Chrome docs)
+would prevent wrong API signatures, invented endpoint URLs, or broken CSP patterns.
+
+Make each question specific enough to be answered by a single reference page.
+Good: "What is the exact method signature of chrome.scripting.executeScript() in MV3?"
+Bad: "How does Chrome storage work?"
+
 Return ONLY the numbered list, no prose, no headers.`),
-    new HumanMessage(`Generate targeted research questions for this extension blueprint:\n\n${blueprintJson}`),
+    new HumanMessage(`Generate hallucination-prevention research questions for:\n\n${blueprintJson}`),
   ]);
 
   const researchQuestions = typeof p1Response.content === "string"
@@ -1466,10 +1575,11 @@ Return ONLY the numbered list, no prose, no headers.`),
   log.info("Phase 2 — Mapping questions to documentation URLs");
 
   const p2Response = await decomposerLLM.invoke([
-    new SystemMessage(`You are a Chrome Extension documentation specialist.
-Given a list of research questions, output a PLAIN LIST of 3-8 authoritative, publicly accessible documentation URLs that directly answer those questions.
-Prefer: developer.chrome.com, official API docs (docs.github.com, developers.notion.com, etc.), MDN.
-Return ONLY one URL per line — no prose, no numbering, no markdown.`),
+    new SystemMessage(`You are a Chrome Extension documentation URL resolver.
+Map each research question to the single most authoritative documentation URL.
+PREFER developer.chrome.com/docs/extensions/reference/api/{name} for Chrome API questions.
+For Web APIs use developer.mozilla.org. For third-party APIs use their official docs.
+Return ONLY one URL per line — no prose, no numbering, no markdown fences.`),
     new HumanMessage(`Find documentation URLs for these research questions:\n\n${researchQuestions}`),
   ]);
 
@@ -1477,19 +1587,27 @@ Return ONLY one URL per line — no prose, no numbering, no markdown.`),
     ? p2Response.content
     : JSON.stringify(p2Response.content);
 
-  const docUrls = urlBlock
-      .split("\n")
-      .map(l => l.trim())
-      .filter(l => l.startsWith("http"))
-      .filter((url) => {
-        try {
-          const parsed = new URL(url);
-          return parsed.protocol === "https:" && ALLOWED_DOC_HOSTS.has(parsed.hostname);
-        } catch {
-          return false;
-        }
-      })
-      .slice(0, 8); // cap at 8 pages
+  const llmSuggestedUrls = urlBlock
+    .split("\n")
+    .map(l => l.trim())
+    .filter(l => l.startsWith("http"))
+    .filter((url) => {
+      try {
+        const parsed = new URL(url);
+        return parsed.protocol === "https:" && ALLOWED_DOC_HOSTS.has(parsed.hostname);
+      } catch {
+        return false;
+      }
+    });
+
+  // Deterministically inject Chrome API reference pages for declared permissions.
+  // These are always correct and target the exact APIs the coder will use.
+  const baselineUrls = (state.blueprint?.permissions ?? [])
+    .slice(0, 4)
+    .map(p => CHROME_API_DOC_URLS[p])
+    .filter((u): u is string => !!u);
+
+  const docUrls = [...new Set([...baselineUrls, ...llmSuggestedUrls])].slice(0, 6);
 
   log.info("Phase 2 complete", { urlCount: docUrls.length, urls: docUrls });
 
@@ -1508,47 +1626,59 @@ Return ONLY one URL per line — no prose, no numbering, no markdown.`),
   const webContent = fetchResults
     .filter((r): r is PromiseFulfilledResult<string> => r.status === "fulfilled" && r.value.length > 0)
     .map(r => r.value)
-    .join("\n\n");
+    .join("\n\n")
+    .slice(0, 12000); // hard cap: 6 pages × 2k chars each keeps synthesis input manageable
 
   log.info("Phase 3 complete", { webContentLength: webContent.length });
 
-  // ── Phase 4: Nia Semantic Recall ─────────────────────────────────────────
-  log.info("Phase 4 — Pulling context from Nia");
+  // ── Phase 4: Nia Semantic Recall (tier-aware depth) ──────────────────────
+  const isMax = state.subscription_tier === "max";
+  log.info(`Phase 4 — Pulling context from Nia (${isMax ? "deep" : "query"} mode)`);
 
   let niaContext = "(Nia unavailable for this run)";
   try {
-    const researcherLLM = getResearcherLLM(); // claude-sonnet-4-5 + NIA_API_KEY
-    const p4Response = await researcherLLM.invoke([
-      new SystemMessage(`You are a Nia context retrieval agent.
-Using your Nia knowledge base, surface ONLY what is directly relevant to the request.
-Do not invent or generalize. Return exact design tokens, code patterns, and API snippets found in Nia.
-Return plain text grouped by clear section headers.`),
-      new HumanMessage(
-        `Retrieve from Nia:\n` +
-        `1. "Chrome Extension Manifest V3 best practices and API patterns"\n` +
-        `2. "${designProfile} design profile: exact raw CSS tokens, spacing scale, colors, border radius"\n` +
-        `3. "Inline SVG usage and micro-interaction CSS for premium static Chrome extension popups"\n\n` +
-        `Blueprint context:\n${blueprintJson}`
-      ),
-    ]);
+    const niaClient = getNiaClient();
+    const niaQueries = buildNiaQueries(state);
 
-    niaContext = typeof p4Response.content === "string"
-      ? p4Response.content
-      : JSON.stringify(p4Response.content);
+    log.info("Phase 4 — Nia queries", { queries: niaQueries, mode: isMax ? "deep+query" : "query" });
 
-    log.info("Phase 4 complete", { niaContextLength: niaContext.length });
+    let niaResults: string[];
+    if (isMax) {
+      // Max tier: searchDeep for the primary (most hallucination-prone) query,
+      // searchQuery for the remaining contextual queries in parallel.
+      const [deepResult, ...restResults] = await Promise.all([
+        niaClient.searchDeep(niaQueries[0]).catch(() => ""),
+        ...niaQueries.slice(1).map((q) => niaClient.searchQuery(q).catch(() => "")),
+      ]);
+      niaResults = [deepResult, ...restResults];
+    } else {
+      // Pro tier: searchQuery for all queries — multi-source RAG against indexed docs.
+      niaResults = await Promise.all(
+        niaQueries.map((q) => niaClient.searchQuery(q).catch(() => ""))
+      );
+    }
+
+    // Cap each result to 1,800 chars so 5 results stay within ~9,000 chars total
+    const combined = niaResults
+      .map((r) => r.slice(0, 1800))
+      .filter(Boolean)
+      .join("\n\n---\n\n");
+
+    if (combined.trim()) niaContext = combined;
+
+    log.info("Phase 4 complete", { niaContextLength: niaContext.length, queryCount: niaQueries.length });
   } catch (err) {
     log.warn("Phase 4 skipped — Nia unavailable", { error: String(err) });
   }
 
   // ── Phase 5: Synthesize (Max-tier only) ──────────────────────────────────
   if (state.subscription_tier !== "max") {
+    // Pro tier: prioritise Nia context and web docs, skip full synthesis.
+    // Cap to 6,000 chars so the coder prompt stays within budget.
     const rawContext = [
-      "## Research Questions\n" + researchQuestions,
-      "## Documentation URLs Consulted\n" + docUrls.join("\n"),
-      "## Web Documentation Content\n" + (webContent || "(no pages fetched)"),
-      "## Nia Design & API Context\n" + niaContext,
-    ].join("\n\n---\n\n");
+      "## Nia API & Design Context\n" + niaContext.slice(0, 3000),
+      "## Web Documentation\n" + webContent.slice(0, 2500),
+    ].join("\n\n---\n\n").slice(0, 6000);
 
     log.info("Phase 5 skipped (Pro tier) — passing raw context", { contextLength: rawContext.length });
     return { research_context: rawContext };
@@ -1558,17 +1688,19 @@ Return plain text grouped by clear section headers.`),
 
   const p5Response = await synthesizerLLM.invoke([
     new SystemMessage(`You are a senior Chrome Extension research analyst.
-Synthesize the provided web documentation content and Nia design context into a clean, structured research brief.
-This brief will be consumed by a coder and a UI designer in separate nodes, so be precise and actionable.
+Synthesize the provided web documentation and Nia context into a COMPACT, actionable grounding brief.
 
-Structure your output with these exact sections:
+HARD CONSTRAINTS:
+- Output MUST be under 4,000 characters total. Cut aggressively.
+- Prioritise: real method signatures, real permission names, exact CSS values, real endpoint paths.
+- No prose, no explanations, no headers longer than one line.
+- Every line must be directly usable by the coder or UI designer. Delete anything decorative.
+
+Structure with these exact sections (keep each section under 800 characters):
 ## Chrome API Patterns & MV3 Rules
-## Third-Party API Integration Guide
 ## CSP & Security Constraints
-## UI Design System Tokens (from Nia)
-## Implementation Gotchas
-
-Be specific. Include real endpoint paths, exact CSS classes, real permission names. No filler prose.`),
+## UI Design Tokens (exact hex/px values only)
+## Implementation Gotchas`),
     new HumanMessage(
       `## Research Questions\n${researchQuestions}\n\n` +
       `## Web Documentation Fetched\n${webContent || "(no pages fetched)"}\n\n` +
@@ -1576,9 +1708,10 @@ Be specific. Include real endpoint paths, exact CSS classes, real permission nam
     ),
   ]);
 
-  const synthesizedBrief = typeof p5Response.content === "string"
+  const synthesizedBrief = (typeof p5Response.content === "string"
     ? p5Response.content
-    : JSON.stringify(p5Response.content);
+    : JSON.stringify(p5Response.content)
+  ).slice(0, 5000); // hard cap: keep coder input budget safe
 
   log.info("Phase 5 complete", { briefLength: synthesizedBrief.length });
   return { research_context: synthesizedBrief };
@@ -1686,62 +1819,99 @@ Use restrained editorial utility styling. Avoid purple-blue AI gradients, emojis
 
 
 // ---------------------------------------------------------------------------
-// Node: coder_node
+// Node: coder_node  (OpenCode-style agentic loop)
 // ---------------------------------------------------------------------------
 
 /**
- * The heart of the pipeline.  Generates all extension source files as a
- * structured JSON map of { "filename": "content" }.
- *
- * On QA-triggered re-runs, qa_logs are injected into the prompt so the
- * model can self-heal the exact errors Playwright captured.
+ * Extract partial source files from a raw LLM text response.
+ * Falls back to regex extraction when full JSON parse fails.
  */
-async function coderNode(
-  state: ExtensyState
-): Promise<Partial<ExtensyState>> {
-  const isRetry = state.qa_logs.length > 0 || state.devtools_summary.length > 0;
-  const connectors = detectRequiredConnectors(state);
-  const log = logger.child({ node: "coder_node", requestId: state.requestId });
-  publishPhase(state, "coder_node", "Writing extension code...");
-  log.info("Generating extension code", {
-    isRetry,
-    attempt: state.qa_retry_count + 1,
-    connectors,
-  });
-
-  const llm = getCoderLLM(state.subscription_tier);
-
-  const systemPrompt = `You are an expert Chrome Extension engineer.
-Produce a complete, production-ready Manifest V3 extension.
-
-Output ONLY a JSON object where each key is a relative file path and each value is
-the stringified file content.  Example:
-{
-  "manifest.json": "{\n  \\"manifest_version\\": 3,\n  ... \n}",
-  "background.js": "// service worker ...\n\nconsole.log('test');",
-  "popup.html": "<!DOCTYPE html>\n<html>\n...",
-  "popup.js": "document.addEventListener('DOMContentLoaded', () => {\n  ...\n});"
+function extractPartialFiles(raw: string): SourceCode {
+  const partial: SourceCode = {};
+  const filePattern =
+    /"([^"]+\.(?:js|ts|html|css|json|md|txt|svg|png))"\s*:\s*"((?:[^"\\]|\\.)*)"/gs;
+  let match: RegExpExecArray | null;
+  while ((match = filePattern.exec(raw)) !== null) {
+    const [, filename, content] = match;
+    partial[filename] = content
+      .replace(/\\n/g, "\n")
+      .replace(/\\t/g, "\t")
+      .replace(/\\\\/g, "\\")
+      .replace(/\\"/g, '"');
+  }
+  return partial;
 }
 
-Rules:
-- Always include manifest.json with manifest_version 3
-- Always include a browser-action popup: popup.html, popup.css, and popup.js. The manifest action.default_popup must point to popup.html.
-- Extension popups are raw static files. Never use Tailwind, utility classes, @tailwind, @apply, build-step CSS, external font imports, CDNs, or framework-only syntax.
-- Write complete, production CSS by hand. Use real selectors that exist in the HTML. Target a stable popup size around 360px wide and 480px tall with responsive overflow.
-- The popup must be a polished product surface, not a placeholder: include a clear title, short description, status/summary area, primary action, disabled/error/empty states where relevant, and accessible labels.
-- Use inline SVG icons with currentColor when helpful. Do not use emoji as UI icons.
-- Never use eval() or inline scripts (CSP compliance)
-- Service workers must follow MV3 patterns (no persistent background pages)
-- All external requests must use host_permissions declared in the manifest
-- Never invent third-party API endpoints, domains, SDK URLs, or SaaS names. External APIs are allowed only when the exact endpoint/domain is present in the user request, connector prompt, or research context.
-- For AI features like Gmail/email summarization without an explicitly provided AI provider endpoint, implement a deterministic local fallback (for example extractive summarization in contentScript.js/popup.js) or a settings UI where the user can enter their own provider endpoint/key. Do not call made-up services such as api.ai-summarizer.com.
-- If auth, database, or payments are part of the product, wire the provided Extensy connector modules instead of inventing raw provider glue
-- Maintain pristine, highly readable code formatting with correct indentation and newlines in your stringified content. Never minify the code!
-- You MUST output file contents only inside the JSON values. Do not wrap code in markdown fences when writing to files.
-- When fixing a localized QA or verification error, preserve unrelated files and make the smallest coherent change.
-- Output ONLY the JSON map — no markdown fences, no prose`;
+/**
+ * Parse a raw LLM text response into a SourceCode map.
+ * Tries strict JSON parse first, then partial regex extraction.
+ */
+function parseSourceCodeFromText(raw: string, log: ReturnType<typeof logger.child>): SourceCode | null {
+  try {
+    const parsed = parseJsonPayload<unknown>(raw);
+    const validation = validateSchema(SourceCodeSchema, parsed);
+    if (validation.success) return validation.data;
+    log.warn("Source code schema validation failed — using raw parse", {
+      validationError: validation.error,
+    });
+    return parsed as SourceCode;
+  } catch {
+    const partial = extractPartialFiles(raw);
+    if (Object.keys(partial).length > 0) {
+      log.warn("Partial file extraction from text", { fileCount: Object.keys(partial).length });
+      return partial;
+    }
+    return null;
+  }
+}
 
-  // ── Build the user prompt with blueprint + research context + QA errors ──
+/**
+ * Build the coder system prompt.
+ *
+ * OpenCode reference: packages/opencode/src/session/system.ts
+ * The system prompt combines the universal OPENCODE_SYSTEM_DISCIPLINE with
+ * Chrome Extension–specific rules and an explicit workflow for the agentic loop.
+ */
+function buildCoderSystemPrompt(connectors: ConnectorKind[], state: ExtensyState): string {
+  const designProfileLine = state.blueprint?.design_profile
+    ? `Target design profile: "${state.blueprint.design_profile}".`
+    : 'Target design profile: "Editorial Utility".';
+
+  return [
+    OPENCODE_SYSTEM_DISCIPLINE,
+    "",
+    "## Chrome Extension Engineering Rules",
+    "- Always include manifest.json with manifest_version: 3.",
+    "- Always include a browser-action popup: popup.html + popup.css + popup.js. manifest action.default_popup must point to popup.html.",
+    "- Extension popups are raw static files. Never use Tailwind, @tailwind, @apply, CDN imports, build-step CSS, external font imports, or framework syntax.",
+    "- Write complete, production CSS by hand. Target 360px wide × 480px tall popup. Use real selectors that exist in the HTML.",
+    "- Popup must be a polished product surface: clear title, short description, status area, primary action button (id=\"primary-action\"), status element (aria-label=\"Status\"), disabled/error/empty states, accessible labels.",
+    "- Use inline SVG icons with currentColor. Do not use emoji as UI icons.",
+    "- Never use eval() or inline scripts (MV3 CSP compliance).",
+    "- Service workers must follow MV3 patterns (no persistent background pages).",
+    "- All external requests must use host_permissions declared in the manifest.",
+    "- Never invent third-party API endpoints, domains, or SDK URLs. External APIs are allowed only when the exact endpoint/domain appears in the user request, connector prompt, or research context.",
+    "- For AI features without an explicitly provided endpoint, implement a local deterministic fallback or a settings UI for user-provided keys.",
+    designProfileLine,
+    connectors.length > 0
+      ? "- Wire the provided Extensy connector modules for auth/database/payments. Do not invent raw provider glue."
+      : "",
+    "- Pristine, highly readable code formatting. Never minify. Correct indentation and newlines throughout.",
+    "- When fixing a QA or verification error, preserve unrelated files and make the smallest coherent change.",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+/**
+ * Build the initial user message for the coder agent.
+ * On QA retries, includes the error log so the agent can self-heal.
+ */
+function buildCoderUserMessage(
+  state: ExtensyState,
+  connectors: ConnectorKind[],
+  isRetry: boolean
+): string {
   const parts: string[] = [];
 
   if (state.blueprint) {
@@ -1754,7 +1924,7 @@ Rules:
 
   if (state.research_context) {
     parts.push(
-      `## Relevant Documentation (from Nia context)\n${state.research_context}`
+      `## Relevant Documentation (from Nia context)\n${state.research_context.slice(0, 5000)}`
     );
   }
 
@@ -1764,7 +1934,7 @@ Rules:
 
   if (state.designBrief) {
     parts.push(
-      `## Structured Design Brief\n\`\`\`json\n${JSON.stringify(state.designBrief, null, 2)}\n\`\`\`\nAll generated UI must follow these tokens and component hierarchy. Do not arbitrarily deviate.`
+      `## Structured Design Brief\n\`\`\`json\n${JSON.stringify(state.designBrief, null, 2)}\n\`\`\`\nAll generated UI must follow these tokens and component hierarchy exactly.`
     );
   }
 
@@ -1782,86 +1952,222 @@ Rules:
     const errorSummary = state.qa_logs
       .map((l) => `[${l.type}/${l.level}] ${l.message}`)
       .join("\n");
-    
-    let retryContext = `## ⚠️ QA Errors — Fix These (attempt ${state.qa_retry_count + 1}/${MAX_QA_RETRIES})\n${errorSummary}`;
-    
+    let retryContext = `## QA Errors — Fix These (attempt ${state.qa_retry_count + 1}/${MAX_QA_RETRIES})\n${errorSummary}`;
     if (state.devtools_summary) {
-      retryContext += `\n\n## 🔍 Deep Browser Diagnostics (DevTools MCP)\n${state.devtools_summary}`;
+      retryContext += `\n\n## Deep Browser Diagnostics (DevTools MCP)\n${state.devtools_summary}`;
     }
-    
+    retryContext +=
+      "\n\nUse read_file to inspect the current file, then edit_file for a surgical fix. Preserve all unrelated code.";
     parts.push(retryContext);
   }
 
-  const userMessage = parts.join("\n\n");
+  return parts.join("\n\n");
+}
 
-  const response = await llm.invoke([
-    new SystemMessage(systemPrompt),
-    new HumanMessage(userMessage),
-  ]);
+/**
+ * The heart of the pipeline — OpenCode-style agentic coder loop.
+ *
+ * OpenCode reference:
+ *   packages/opencode/src/session/prompt.ts  (loop function, tool execution)
+ *   packages/opencode/src/tool/registry.ts   (BashTool, ReadTool, WriteTool, EditTool)
+ *
+ * Replaces the previous single-shot LLM call with an iterative tool-calling loop:
+ *   1. LLM receives tools: write_file / edit_file / read_file / list_files / bash_check
+ *   2. LLM writes extension files one-by-one (or in parallel batches)
+ *   3. After verifying with bash_check, LLM outputs a completion signal (text, no tool calls)
+ *   4. On the last step (isLastStep), tools are removed — LLM falls back to JSON output
+ *   5. Workspace (SourceCode map) accumulates across all steps; text JSON fills any gaps
+ *
+ * On QA-triggered re-runs (isRetry), the workspace is pre-seeded from state.source_code
+ * so the LLM can use edit_file for surgical fixes rather than rewriting everything.
+ */
+async function coderNode(state: ExtensyState): Promise<Partial<ExtensyState>> {
+  const isRetry = state.qa_logs.length > 0 || state.devtools_summary.length > 0;
+  const connectors = detectRequiredConnectors(state);
+  const log = logger.child({ node: "coder_node", requestId: state.requestId });
+  const maxSteps = MAX_AGENT_STEPS[state.subscription_tier] ?? 3;
 
-  const raw =
-    typeof response.content === "string"
-      ? response.content
-      : JSON.stringify(response.content);
+  publishPhase(state, "coder_node", "Writing extension code...");
+  log.info("Agentic coder started", {
+    isRetry,
+    attempt: state.qa_retry_count + 1,
+    connectors,
+    maxSteps,
+    tier: state.subscription_tier,
+  });
 
-  let sourceCode: SourceCode;
-  try {
-    const parsed = parseJsonPayload<unknown>(raw);
-    const validation = validateSchema(SourceCodeSchema, parsed);
-    if (!validation.success) {
-      log.warn("Source code schema validation failed — using raw parse", {
-        validationError: validation.error,
-      });
-      sourceCode = parsed as SourceCode;
-    } else {
-      sourceCode = validation.data;
+  // ── Free-tier Nia grounding (inject before the loop, same as before) ───────
+  const stateParts: string[] = [];
+  if (state.subscription_tier === "free" && !state.research_context && !isRetry) {
+    try {
+      const primaryPerm = state.blueprint?.permissions?.[0];
+      const niaQuery = primaryPerm
+        ? `Chrome Extension MV3 chrome.${primaryPerm} API method signatures parameters code examples`
+        : "Chrome Extension MV3 activeTab scripting executeScript API patterns content scripts";
+      const niaClient = getNiaClient();
+      const webGrounding = await niaClient.searchWeb(niaQuery, 3);
+      if (webGrounding.trim()) {
+        stateParts.push(`## Chrome API Quick Reference (Nia)\n${webGrounding.slice(0, 600)}`);
+        log.info("Free-tier Nia grounding injected", { chars: Math.min(webGrounding.length, 600) });
+      }
+    } catch (err) {
+      log.warn("Free-tier Nia grounding skipped", { error: String(err) });
+    }
+  }
+
+  const llm = getCoderLLM(state.subscription_tier);
+  const ctx = configureNodeContext(state);
+  const systemPromptText = buildCoderSystemPrompt(connectors, state);
+  const initialUserContent = [
+    buildCoderUserMessage(state, connectors, isRetry),
+    ...stateParts,
+  ].join("\n\n");
+
+  // On retries, pre-seed the workspace so the agent can read/edit existing files
+  const workspace: SourceCode = isRetry ? { ...state.source_code } : {};
+
+  const messages: ApiMessage[] = [
+    { role: "system", content: systemPromptText },
+    { role: "user", content: initialUserContent },
+  ];
+
+  // ── OpenCode-style agentic loop ────────────────────────────────────────────
+  for (let step = 0; step < maxSteps; step++) {
+    const isLastStep = step === maxSteps - 1;
+    const tools = isLastStep ? [] : CODER_TOOLS;
+
+    publishPhase(
+      state,
+      "coder_node",
+      `Agentic step ${step + 1}/${maxSteps}${isLastStep ? " (final)" : ""}...`
+    );
+    log.info("Agentic loop step", { step: step + 1, maxSteps, isLastStep, hasTools: tools.length > 0 });
+
+    let turn;
+    try {
+      turn = await llm.invokeWithTools(messages, tools);
+    } catch (err) {
+      log.error("LLM turn failed", { step: step + 1, error: String(err) });
+      return { error: `coder_node: LLM error at step ${step + 1} — ${String(err)}` };
     }
 
-    for (const [filename, content] of Object.entries(sourceCode)) {
-      if (filename.endsWith(".json")) {
-        try { sourceCode[filename] = JSON.stringify(JSON.parse(content), null, 2); }
-        catch {} // leave as-is if the generated JSON is invalid
+    if (turn.rawToolCalls.length > 0 && !isLastStep) {
+      // ── Tool-calling turn: execute tools, accumulate messages ──────────────
+      messages.push({
+        role: "assistant",
+        content: turn.content,
+        tool_calls: turn.rawToolCalls,
+      });
+
+      // Execute all tool calls in parallel (OpenCode pattern — independent writes/checks run concurrently)
+      const toolResults = await Promise.all(
+        turn.rawToolCalls.map(async (toolCall) => {
+          let parsedArgs: unknown;
+          try {
+            parsedArgs = JSON.parse(toolCall.function.arguments);
+          } catch {
+            parsedArgs = {};
+          }
+          const result = await executeAgentTool(
+            toolCall.function.name,
+            parsedArgs,
+            workspace,
+            ctx,
+            TMP_EXT_DIR
+          );
+          return { toolCall, result };
+        })
+      );
+
+      for (const { toolCall, result } of toolResults) {
+        messages.push({
+          role: "tool",
+          tool_call_id: toolCall.id,
+          content: result.output,
+        });
+        log.info("Tool executed", {
+          step: step + 1,
+          tool: toolCall.function.name,
+          isError: result.isError,
+          outputPreview: result.output.slice(0, 120),
+        });
+      }
+
+      // Synthetic recovery message when any tool fails (OpenCode error-recovery pattern)
+      const toolErrors = toolResults.filter(({ result }) => result.isError);
+      if (toolErrors.length > 0) {
+        const summary = toolErrors
+          .map(({ toolCall, result }) => `'${toolCall.function.name}': ${result.output}`)
+          .join("\n");
+        messages.push({
+          role: "user",
+          content: `The following tool calls failed — fix and retry:\n${summary}`,
+        });
+      }
+
+      // Publish live workspace size so the frontend can show progress
+      const workspaceFileCount = Object.keys(workspace).length;
+      if (workspaceFileCount > 0) {
+        bus.publish({
+          type: "phase.started",
+          requestId: state.requestId,
+          node: "coder_node",
+          message: `Workspace: ${workspaceFileCount} file${workspaceFileCount !== 1 ? "s" : ""} written`,
+        });
+      }
+
+      continue;
+    }
+
+    // ── Text response turn: extract source code ────────────────────────────
+    const textContent = turn.content ?? "";
+
+    // If the agent wrote files via tools, the workspace is the source of truth.
+    // Text output may also contain a JSON backup — merge with workspace winning.
+    if (textContent) {
+      const fromText = parseSourceCodeFromText(textContent, log);
+      if (fromText) {
+        // Workspace files override text-parsed files (they are more up-to-date)
+        Object.assign(workspace, { ...fromText, ...workspace });
       }
     }
-  } catch (err) {
-    log.warn("Full JSON parse failed — attempting partial file extraction", { error: String(err) });
 
-    const partialFiles: SourceCode = {};
-    const filePattern = /"([^"]+\.(?:js|ts|html|css|json|md|txt|svg|png))"\s*:\s*"((?:[^"\\]|\\.)*)"/gs;
-    let match: RegExpExecArray | null;
-    while ((match = filePattern.exec(raw)) !== null) {
-      const [, filename, content] = match;
-      partialFiles[filename] = content
-        .replace(/\\n/g, "\n")
-        .replace(/\\t/g, "\t")
-        .replace(/\\\\/g, "\\")
-        .replace(/\\"/g, '"');
-    }
+    log.info("Agent loop complete", {
+      step: step + 1,
+      workspaceFiles: Object.keys(workspace).length,
+      finishReason: turn.finishReason,
+    });
+    break;
+  }
 
-    if (Object.keys(partialFiles).length > 0) {
-      log.warn("Partial extraction recovered files", { fileCount: Object.keys(partialFiles).length });
-      sourceCode = partialFiles;
-    } else {
-      log.error("Could not recover any files from LLM response", { error: String(err) });
-      return { error: `coder_node: Failed to parse generated source — ${String(err)}` };
+  // ── Validate workspace ────────────────────────────────────────────────────
+  if (Object.keys(workspace).length === 0) {
+    log.error("Agent loop produced no source files");
+    return { error: "coder_node: Agent loop exhausted without producing any source files" };
+  }
+
+  // Normalise JSON files that may have been written with unformatted content
+  for (const [filename, content] of Object.entries(workspace)) {
+    if (filename.endsWith(".json")) {
+      try {
+        workspace[filename] = JSON.stringify(JSON.parse(content), null, 2);
+      } catch {
+        // leave as-is if the generated JSON is invalid — verifyNode will catch it
+      }
     }
   }
 
   log.info("Code generation complete", {
-    fileCount: Object.keys(sourceCode).length,
-    files: Object.keys(sourceCode),
+    fileCount: Object.keys(workspace).length,
+    files: Object.keys(workspace),
   });
 
   const connectorFiles = buildConnectorFiles(connectors);
-  const withConnectorFiles = {
-    ...sourceCode,
-    ...connectorFiles,
-  };
+  const withConnectorFiles = { ...workspace, ...connectorFiles };
+
   const ungroundedEndpoints = findUngroundedExternalEndpoints(withConnectorFiles, state);
   if (ungroundedEndpoints.length > 0) {
-    log.error("Generated ungrounded external endpoints", {
-      endpoints: ungroundedEndpoints,
-    });
+    log.error("Generated ungrounded external endpoints", { endpoints: ungroundedEndpoints });
     return {
       error:
         "coder_node: Generated ungrounded external endpoint(s): " +
@@ -1885,7 +2191,6 @@ Rules:
     source_code: polishedSourceCode,
     fileVersions,
     verify_error: "",
-    // Reset qa_logs so only the *current* run's errors flow into the next retry.
     qa_logs: [],
     qa_retry_count: state.qa_retry_count + (isRetry ? 1 : 0),
   };
@@ -1936,8 +2241,8 @@ Example: { "popup.html": "...", "popup.css": "..." }
 Do not remove functionality or data bindings. Only ENHANCE the styles and structure.
 Output ONLY the JSON map — no markdown fences, no prose.`;
 
-  const userMessageContent = state.research_context 
-    ? `Structured Design Brief:\n${JSON.stringify(state.designBrief, null, 2)}\n\nNia Design Inspiration Context:\n${state.research_context}\n\nEnhance the UI of the following extension code:\n\n${codeSnapshot}`
+  const userMessageContent = state.research_context
+    ? `Structured Design Brief:\n${JSON.stringify(state.designBrief, null, 2)}\n\nNia Design Inspiration Context:\n${state.research_context.slice(0, 3000)}\n\nEnhance the UI of the following extension code:\n\n${codeSnapshot}`
     : `Structured Design Brief:\n${JSON.stringify(state.designBrief, null, 2)}\n\nEnhance the UI of the following extension code:\n\n${codeSnapshot}`;
 
   const response = await llm.invoke([
@@ -2748,6 +3053,7 @@ export const __test__ = {
   integrationNode,
   verifyNode,
   assemblerNode,
+  qaRouterFn,
   ensurePremiumPopup,
   findUngroundedExternalEndpoints,
 };

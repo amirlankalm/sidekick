@@ -10,6 +10,40 @@ import { SystemMessage, type BaseMessage } from "@langchain/core/messages";
 import type { SubscriptionTier } from "./state";
 import { logger } from "./logger";
 
+// ---------------------------------------------------------------------------
+// OpenAI-compatible tool schema types (used by invokeWithTools / agentic loop)
+// ---------------------------------------------------------------------------
+
+export interface ToolDefinition {
+  type: "function";
+  function: {
+    name: string;
+    description: string;
+    parameters: {
+      type: "object";
+      properties: Record<string, { type: string; description: string; enum?: string[] }>;
+      required: string[];
+    };
+  };
+}
+
+export interface ApiToolCall {
+  id: string;
+  type: "function";
+  function: { name: string; arguments: string };
+}
+
+export type ApiMessage =
+  | { role: "system" | "user"; content: string }
+  | { role: "assistant"; content: string | null; tool_calls?: ApiToolCall[] }
+  | { role: "tool"; tool_call_id: string; content: string };
+
+export interface AgentTurnResult {
+  content: string | null;
+  rawToolCalls: ApiToolCall[];
+  finishReason: "stop" | "tool_calls" | "length" | "unknown";
+}
+
 const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai";
 const GEMINI_FLASH_MODEL = process.env.GEMINI_FLASH_MODEL ?? "gemini-2.0-flash-latest";
 const GEMINI_PRO_MODEL   = process.env.GEMINI_PRO_MODEL   ?? "gemini-2.5-pro-latest";
@@ -40,7 +74,6 @@ export type NodeRole =
 export interface LLMFactoryOptions {
   role: NodeRole;
   tier: SubscriptionTier;
-  withNiaContext?: boolean;
   temperature?: number;
 }
 
@@ -53,18 +86,42 @@ interface InvocationResult {
   content: string;
 }
 
-export const OPENCODE_SYSTEM_DISCIPLINE = `You are an autonomous coding agent. Follow these rules:
-- Be concise. Answer in 1-3 sentences or a short paragraph unless asked for detail. No introductions, no conclusions, no summaries.
-- Never explain your code unless the user explicitly asks. After writing or editing, just stop.
-- Do not use emojis unless explicitly requested.
-- When multiple independent files or searches are needed, execute them in parallel in a single batch.
-- Run linting/typechecking after all edits before declaring the task complete.
-- Never commit changes to git or write to .env files unless explicitly asked.
-- Before editing, check the existing file's conventions (naming, imports, quote style) and mimic them exactly.
-- If you cannot do something, state it in one sentence and offer an alternative. Do not preach.`;
+/**
+ * OpenCode-style system discipline injected into all LLM nodes.
+ * Derived from opencode:packages/opencode/src/session/prompt/anthropic.txt
+ * and the Gemini variant at prompt/gemini.txt.
+ */
+export const OPENCODE_SYSTEM_DISCIPLINE = `You are an autonomous coding agent. Follow these rules at all times:
+
+WORKFLOW (mirrors OpenCode build-agent protocol):
+1. UNDERSTAND: Read existing files before modifying. Use read_file / list_files to understand current state.
+2. PLAN: Reason briefly about architecture before writing. Consider which Chrome APIs and files are needed.
+3. IMPLEMENT: Write files incrementally using write_file. One file at a time. Start with manifest.json.
+4. VERIFY: After writing .js files, run bash_check to catch syntax errors early.
+5. REVIEW: Use read_file to confirm a written file looks correct. Use edit_file for surgical fixes.
+
+EXECUTION RULES:
+- Execute independent tool calls in parallel in a single turn (e.g. write popup.html and popup.css simultaneously).
+- Never explain code unless explicitly asked. After writing or editing, just proceed.
+- Do not use emojis unless the user explicitly requests them.
+- Run bash_check after writing every .js file (when shell access is available).
+- Never commit to git or write to .env files unless explicitly asked.
+- Mimic existing file conventions (naming, imports, quote style) when editing.
+- If you cannot do something, state it in one sentence and offer an alternative.
+
+OUTPUT FORMAT:
+- When tools are available: use write_file / edit_file / read_file / list_files / bash_check / grep_workspace.
+- Use grep_workspace to locate a symbol or selector before editing — never read a whole file just to find one line.
+- When no tools are available (final output step): output the complete source map as a single JSON object where each key is a relative file path and each value is the raw file content. No markdown fences around the JSON. No prose.`;
 
 export interface SidekickLLM {
   invoke(messages: BaseMessage[]): Promise<InvocationResult>;
+  /**
+   * OpenCode-style tool-calling turn.  Accepts messages in native OpenAI
+   * format (including tool-result messages) and returns the raw tool-call
+   * list alongside any text content, so the caller can run the agentic loop.
+   */
+  invokeWithTools(messages: ApiMessage[], tools: ToolDefinition[]): Promise<AgentTurnResult>;
 }
 
 type LLMFactoryOverride = ((options: LLMFactoryOptions) => SidekickLLM) | null;
@@ -137,6 +194,92 @@ class GeminiChatModel implements SidekickLLM {
     }
 
     throw new Error("Gemini request failed after 3 retries");
+  }
+
+  async invokeWithTools(
+    messages: ApiMessage[],
+    tools: ToolDefinition[]
+  ): Promise<AgentTurnResult> {
+    const payload: Record<string, unknown> = {
+      model: this.options.model,
+      messages,
+      temperature: this.options.temperature,
+      max_tokens: this.options.maxTokens,
+    };
+    if (tools.length > 0) {
+      payload.tools = tools;
+    }
+
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const response = await fetch(`${GEMINI_BASE_URL}/chat/completions`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${this.options.apiKey}`,
+          "Content-Type": "application/json",
+          ...(this.options.defaultHeaders ?? {}),
+        },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(90_000),
+      });
+
+      const data = (await response.json().catch(() => null)) as
+        | {
+            error?: { message?: string };
+            choices?: Array<{
+              finish_reason?: string;
+              message?: {
+                content?: string | null;
+                tool_calls?: ApiToolCall[];
+              };
+            }>;
+          }
+        | null;
+
+      if (!response.ok) {
+        if (response.status === 429 && attempt < 3) {
+          const retryAfter = response.headers.get("retry-after");
+          const waitMs = resolveRetryDelayMs(retryAfter, data?.error?.message, attempt);
+          logger.warn("Gemini rate limited (invokeWithTools) — retrying", {
+            node: this.options.role,
+            attempt,
+            retryAfterSec: Math.round(waitMs / 1000),
+          });
+          await sleep(waitMs);
+          continue;
+        }
+        throw new Error(
+          `Gemini invokeWithTools failed (${response.status}): ${data?.error?.message ?? "unknown error"}`
+        );
+      }
+
+      const choice = data?.choices?.[0];
+      const msg = choice?.message;
+      const finishReason = choice?.finish_reason ?? "unknown";
+      const rawToolCalls: ApiToolCall[] = msg?.tool_calls ?? [];
+      const content = msg?.content?.trim() ?? null;
+
+      logger.info("Gemini invokeWithTools turn", {
+        node: this.options.role,
+        finishReason,
+        toolCallCount: rawToolCalls.length,
+        hasContent: content !== null,
+      });
+
+      return {
+        content,
+        rawToolCalls,
+        finishReason:
+          finishReason === "tool_calls"
+            ? "tool_calls"
+            : finishReason === "stop"
+              ? "stop"
+              : finishReason === "length"
+                ? "length"
+                : "unknown",
+      };
+    }
+
+    throw new Error("Gemini invokeWithTools failed after 3 retries");
   }
 }
 
@@ -222,22 +365,11 @@ function extractMessageContent(message: BaseMessage): string {
 export function getLLM(options: LLMFactoryOptions): SidekickLLM {
   if (llmFactoryOverride) return llmFactoryOverride(options);
 
-  const { role, withNiaContext = false, temperature } = options;
+  const { role, temperature } = options;
   const apiKey = process.env.GEMINI_API_KEY;
 
   if (!apiKey) {
     throw new Error("[llm_config] GEMINI_API_KEY is not set in environment");
-  }
-
-  const defaultHeaders: Record<string, string> = {};
-  if (withNiaContext) {
-    const niaKey = process.env.NIA_API_KEY;
-    if (!niaKey) {
-      throw new Error(
-        "[llm_config] NIA_API_KEY is not set but withNiaContext=true was requested"
-      );
-    }
-    defaultHeaders["X-Nia-Api-Key"] = niaKey;
   }
 
   const resolvedTemp =
@@ -252,7 +384,6 @@ export function getLLM(options: LLMFactoryOptions): SidekickLLM {
     tier: options.tier,
     temperature: resolvedTemp,
     maxTokens: MAX_TOKENS_BY_ROLE[role],
-    niaContext: withNiaContext,
   });
 
   return new GeminiChatModel({
@@ -261,13 +392,12 @@ export function getLLM(options: LLMFactoryOptions): SidekickLLM {
     maxTokens: MAX_TOKENS_BY_ROLE[role],
     temperature: resolvedTemp,
     role,
-    ...(Object.keys(defaultHeaders).length > 0 ? { defaultHeaders } : {}),
   });
 }
 
 export const getArchitectLLM  = () => getLLM({ role: "architect",   tier: "max" });
 export const getCoderLLM      = (tier: SubscriptionTier) => getLLM({ role: "coder", tier });
-export const getResearcherLLM = () => getLLM({ role: "researcher",  tier: "max", withNiaContext: true });
+export const getResearcherLLM = () => getLLM({ role: "researcher",  tier: "max" });
 export const getUIDesignerLLM = () => getLLM({ role: "ui_designer", tier: "max" });
 export const getLegalLLM      = () => getLLM({ role: "legal",       tier: "free" });
 export const getRouterLLM     = () => getLLM({ role: "router",      tier: "free" });
