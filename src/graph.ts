@@ -2517,9 +2517,9 @@ Output ONLY the JSON map — no markdown fences, no prose.`;
 // ---------------------------------------------------------------------------
 
 function uiDesignerRouterFn(
-  _state: ExtensyState
-): "ui_designer_node" | "verify_node" {
-  // UI designer runs for all tiers.
+  state: ExtensyState
+): "ui_designer_node" | typeof END {
+  if (state.error) return END;
   return "ui_designer_node";
 }
 

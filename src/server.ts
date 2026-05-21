@@ -358,6 +358,13 @@ app.post("/generate", generateLimiter, async (req: Request, res: Response) => {
       return;
     }
 
+    if (Object.keys(finalState.source_code).length === 0) {
+      log.error("Pipeline completed but source_code is empty", { status: finalState.status });
+      emit("error", { message: "Pipeline completed but produced no source files. Please try again." });
+      res.end();
+      return;
+    }
+
     emit("files", finalState.source_code);
 
     if (finalState.legal_url || finalState.privacy_url) {
