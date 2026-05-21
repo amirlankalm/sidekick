@@ -9,7 +9,11 @@
     "start": "node dist/server.js",
     "serve": "npx ts-node src/server.ts",
     "dev": "npx ts-node src/graph.ts",
-    "install:playwright": "npx playwright install chromium"
+    "install:playwright": "npx playwright install chromium",
+    "eval": "npm run build && node dist/eval/index.js",
+    "eval:critical": "npm run build && node dist/eval/index.js -- --category=critical",
+    "eval:security": "npm run build && node dist/eval/index.js -- --filter=security",
+    "eval:quick": "npm run build && node dist/eval/index.js -- --no-save --filter=pipeline"
   },
   "dependencies": {
     "@langchain/core": "^1.1.45",

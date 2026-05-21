@@ -2861,7 +2861,7 @@ function qaRouterFn(
   }
 
   if (state.qa_logs.length > 0 && state.qa_retry_count < MAX_QA_RETRIES) {
-    log.info("QA issues found — retrying coder_node", {
+    log.info("QA issues found — retrying via compaction_node → design_brief_node → coder_node", {
       issueCount: state.qa_logs.length,
       retry: `${state.qa_retry_count + 1}/${MAX_QA_RETRIES}`,
     });

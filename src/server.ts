@@ -172,7 +172,6 @@ const PHASE_MESSAGES: Record<string, string> = {
   ui_designer_node: "Polishing popup UI...",
   verify_node:      "Running static verification...",
   qa_node:          "Running QA tests in Chromium...",
-  devtools_node:    "Performing deep DevTools diagnostics...",
   fan_out_router:   "Preparing final steps...",
   legal_node:       "Generating legal documents...",
   integration_node: "Wiring third-party integrations...",

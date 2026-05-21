@@ -395,6 +395,8 @@ test("compaction node summarizes oversized development context", async () => {
 
 test("free-tier graph completes end-to-end and emits granular pipeline events", async () => {
   installMockLLM();
+  installMockNia();
+  installMockContext7();
   const events: BusEvent[] = [];
   const unsubscribe = bus.subscribeAll((event) => {
     if (!event.requestId || event.requestId === "pipeline-test") events.push(event);
